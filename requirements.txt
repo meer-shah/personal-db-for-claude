@@ -98,6 +98,12 @@ scipy==1.17.1
 sentence-transformers==5.4.1
 setuptools==81.0.0
 shellingham==1.5.4
+httpx-sse==0.4.3
+mcp==1.9.0
+pydantic-settings==2.14.0
+python-multipart==0.0.27
+slowapi==0.1.9
+sse-starlette==3.4.1
 starlette==1.0.0
 std-uritemplate==2.0.8
 sympy==1.14.0

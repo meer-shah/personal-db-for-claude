@@ -496,16 +496,34 @@ def run_delta() -> None:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _collect_all_files(token: str) -> list[dict]:
+    import time
     import requests as req_lib
     GRAPH   = "https://graph.microsoft.com/v1.0"
     headers = {"Authorization": f"Bearer {token}"}
     results = []
 
+    def _get_with_retry(url: str, max_attempts: int = 6) -> dict:
+        # Graph API regularly returns 429/503/504 on large folders;
+        # retry with exponential backoff so the indexer survives transient errors.
+        for attempt in range(max_attempts):
+            try:
+                resp = req_lib.get(url, headers=headers, timeout=60)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    wait = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    print(f"[WARN] Graph {resp.status_code} on {url[:80]}… retry in {wait}s (attempt {attempt+1}/{max_attempts})")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (req_lib.exceptions.ConnectionError, req_lib.exceptions.Timeout) as e:
+                wait = 2 ** attempt
+                print(f"[WARN] Graph network error: {e!r} — retry in {wait}s (attempt {attempt+1}/{max_attempts})")
+                time.sleep(wait)
+        raise RuntimeError(f"Graph API failed after {max_attempts} attempts: {url}")
+
     def _recurse(url: str) -> None:
         while url:
-            resp = req_lib.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+            data = _get_with_retry(url)
             for item in data.get("value", []):
                 if "folder" in item:
                     child_url = f"{GRAPH}/me/drive/items/{item['id']}/children"
