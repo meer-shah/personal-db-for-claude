@@ -154,9 +154,27 @@ Create a non-root user (skip if your sudo user already exists):
 ```bash
 adduser marcvista
 usermod -aG sudo,docker marcvista
-# Add your SSH key to /home/marcvista/.ssh/authorized_keys
-# Then disable password auth in /etc/ssh/sshd_config and: systemctl restart ssh
 ```
+
+Add your SSH key so you can log in as the new user:
+
+```bash
+mkdir -p /home/marcvista/.ssh
+cp /root/.ssh/authorized_keys /home/marcvista/.ssh/authorized_keys
+chown -R marcvista:marcvista /home/marcvista/.ssh
+chmod 700 /home/marcvista/.ssh
+chmod 600 /home/marcvista/.ssh/authorized_keys
+```
+
+Disable password auth:
+
+```bash
+sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+systemctl restart ssh
+```
+
+> **Important:** The `sudo` and `docker` group memberships only take effect after a **fresh login**. After running `usermod`, always log out of root and reconnect as your new user from your laptop (`ssh marcvista@<SERVER_IP>`). Do not use `su - marcvista` from within the root session — group memberships will be missing and `sudo` / `docker` commands will fail.
 
 ---
 
@@ -195,8 +213,8 @@ written automatically in step 8.
 
 ```bash
 docker compose up -d
-# Verify
-curl http://localhost:6333/collections
+# Wait for Qdrant to initialize, then verify
+sleep 10 && curl http://localhost:6333/collections
 # Expected: {"result":{"collections":[]},"status":"ok",...}
 ```
 
@@ -323,6 +341,7 @@ so explicitly. Otherwise, the steps above are sufficient.
 | Indexer finds 0 files | Refresh token not yet written; re-run `python onedrive.py` |
 | Claude Desktop says "401" | Bearer token in client config doesn't match server `.env` |
 | `index_status` returns 0 points | First full index never ran — see step 10 |
+| `docker compose up -d` says "permission denied" on docker socket | `marcvista` user is not in the `docker` group for this session. Fix: log out completely and log back in, or run `exit` to root then `usermod -aG docker marcvista`, then `su - marcvista`. Verify with `groups` — `docker` must appear. |
 
 Logs:
 

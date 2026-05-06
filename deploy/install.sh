@@ -39,6 +39,7 @@ done
 cp "$APP_DIR/deploy/systemd/pkp-indexer.timer" /etc/systemd/system/
 
 # Caddyfile
+mkdir -p /etc/caddy
 sed "s|<DOMAIN>|$PKP_DOMAIN|g" "$APP_DIR/deploy/Caddyfile.template" \
     > /etc/caddy/Caddyfile
 
