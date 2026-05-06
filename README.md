@@ -10,13 +10,65 @@ This README is the full bootstrap guide for a fresh server.
 
 ## 1. Prerequisites
 
-- A Linux server (tested on Hetzner CX52, Ubuntu 24.04 LTS, 4 cores, 16 GB RAM,
-  100 GB+ disk).
-- Root access (or a sudo user).
-- Either a real domain pointed at the server, **or** willingness to use
-  `<your-ip-with-dashes>.nip.io` (free, no DNS setup).
+### Server sizing (Hetzner Cloud recommended)
+
+Pick based on your OneDrive library size:
+
+| Library size | Recommended | Specs | Price (Hetzner) |
+|---|---|---|---|
+| Up to ~10k files / 50 GB | CX32 | 4 vCPU, 8 GB RAM, 80 GB disk | ~€9/mo |
+| Up to ~50k files / 200 GB | **CX42** (sweet spot) | 8 vCPU, 16 GB RAM, 160 GB disk | ~€18/mo |
+| Up to ~200k files / 1 TB | **CX52** (recommended) | 16 vCPU, 32 GB RAM, 360 GB disk | ~€36/mo |
+| 1 TB+ | CX62 | 32 vCPU, 64 GB RAM, 600 GB disk | ~€68/mo |
+
+> The bottleneck is RAM (the embedding model needs ~2 GB) and disk (Qdrant
+> stores vectors — roughly 1 GB per 50k chunks). CPU matters during the
+> initial index; after that it's mostly idle.
+
+**OS:** Ubuntu 24.04 LTS on all of the above.
+
+To provision on Hetzner:
+1. Go to https://console.hetzner.cloud → your project → **Add Server**
+2. Location: any (Nuremberg or Helsinki are fine)
+3. Image: **Ubuntu 24.04**
+4. Type: pick from table above
+5. SSH Keys: add your public key (paste output of `cat ~/.ssh/id_ed25519.pub` from your laptop)
+6. Name it something meaningful (e.g. `pkp-prod`)
+7. Click **Create & Buy now**
+
+The server's public IPv4 appears on the dashboard within 30 seconds.
+
+### Other prerequisites
+
+- Root access (or a sudo user) on the server.
+- Either a real domain pointed at the server's IP, **or** use
+  `<your-ip-with-dashes>.nip.io` for free (e.g. IP `1.2.3.4` → domain `1-2-3-4.nip.io`).
 - A Microsoft account with the OneDrive library you want to index.
 - Python 3.12, Docker, Caddy — installed in step 4 below.
+
+### Connecting from Windows
+
+Open PowerShell **as Administrator** (right-click PowerShell → "Run as
+administrator"). If `ssh` is not recognised, run this once to enable it:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+```
+
+Then connect:
+
+```powershell
+ssh root@<SERVER_IP>
+```
+
+The first time you connect, it will ask:
+
+```
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+Type `yes` and press Enter. This is normal — it's saving the server's
+fingerprint so future connections are verified automatically.
 
 The repo can be cloned anywhere — paths inside the Python code resolve
 relative to the repo root automatically. The systemd `install.sh` script
