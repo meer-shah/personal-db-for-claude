@@ -342,6 +342,7 @@ so explicitly. Otherwise, the steps above are sufficient.
 | Claude Desktop says "401" | Bearer token in client config doesn't match server `.env` |
 | `index_status` returns 0 points | First full index never ran — see step 10 |
 | `docker compose up -d` says "permission denied" on docker socket | `marcvista` user is not in the `docker` group for this session. Fix: log out completely and log back in, or run `exit` to root then `usermod -aG docker marcvista`, then `su - marcvista`. Verify with `groups` — `docker` must appear. |
+| `Failed to enable unit: Unit file caddy.service does not exist` | Caddy was not installed yet when `install.sh` ran. Install it first (step 4c), then re-run `sudo systemctl enable --now caddy`. If `apt install caddy` asks about the Caddyfile conflict, choose **N** to keep the version that `install.sh` already wrote. |
 
 Logs:
 

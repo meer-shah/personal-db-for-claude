@@ -98,6 +98,7 @@ scipy==1.17.1
 sentence-transformers==5.4.1
 setuptools==81.0.0
 shellingham==1.5.4
+slowapi==0.1.9
 starlette==1.0.0
 std-uritemplate==2.0.8
 sympy==1.14.0
