@@ -1,0 +1,5 @@
+# Replace <DOMAIN> with your real domain or <your-ip-with-dashes>.nip.io.
+# Caddy will fetch a Let's Encrypt cert automatically on first start.
+<DOMAIN> {
+    reverse_proxy localhost:8000
+}

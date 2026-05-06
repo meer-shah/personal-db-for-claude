@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PKP delta indexer every hour
+Requires=pkp-indexer.service
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

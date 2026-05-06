@@ -1,0 +1,37 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project runtime
+logs/
+*.log
+/tmp_index/
+test_output/
+
+# Local Caddy state
+caddy_data/
+caddy_config/
+FINAL-DOCUMENTATIONS-TO-SHARE/
+project_files/

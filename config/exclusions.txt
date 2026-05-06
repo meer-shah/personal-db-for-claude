@@ -1,0 +1,16 @@
+# PKP Exclusion List — one pattern per line (glob syntax)
+# Folders:  /Personal    matches the folder and all files inside
+# Files:    *.tmp        matches any file with that extension
+# Prefix #  for comments
+
+# System / temp files
+*.tmp
+*.log
+~$*
+.DS_Store
+Thumbs.db
+
+# OneDrive system folders
+/System Volume Information
+/.trash
+/.Trash
