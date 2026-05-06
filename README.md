@@ -245,23 +245,39 @@ sudo ./deploy/install.sh
 # It will prompt for your domain (e.g. example.com or 1-2-3-4.nip.io)
 ```
 
-Then enable and start everything:
+Then enable and start everything — **run each line separately**:
 
 ```bash
 sudo systemctl enable --now caddy
+```
+```bash
 sudo systemctl enable --now pkp-mcp.service
+```
+```bash
 sudo systemctl enable --now pkp-indexer.timer
 ```
+
+> **Note:** Run these one at a time, not as a block. Pasting all three at once can cause the shell to swallow the second and third commands silently.
 
 Verify:
 
 ```bash
-sudo systemctl status pkp-mcp.service caddy
+sudo systemctl status pkp-mcp.service caddy pkp-indexer.timer
+```
+```bash
 curl https://<your-domain>/health
 # Expected: {"status":"ok"}
 ```
 
 Caddy will request a Let's Encrypt cert on first run — give it ~30 seconds.
+
+If `pkp-mcp.service` shows `inactive (dead)` after enabling, start it manually and check the log:
+
+```bash
+sudo systemctl start pkp-mcp.service
+sleep 5
+sudo tail -n 30 /var/log/pkp/mcp.log
+```
 
 ---
 
@@ -292,13 +308,27 @@ Expect ~30 chunks per file on average. A 1000-file library typically takes
 ## 11. Verify end-to-end
 
 ```bash
-# Health
+# Service health (all three should be active)
+sudo systemctl status pkp-mcp.service caddy pkp-indexer.timer
+```
+```bash
+# HTTPS endpoint
 curl https://<your-domain>/health
-
-# Index status (auth required)
+# Expected: {"status":"ok"}
+```
+```bash
+# Qdrant collection (should show pkp_chunks with vectors)
+curl http://localhost:6333/collections/pkp_chunks
+```
+```bash
+# Authenticated tool call (replace <TOKEN> with your MCP_BEARER_TOKEN)
 curl https://<your-domain>/tools/index_status \
-    -H "Authorization: Bearer $MCP_BEARER_TOKEN"
-# Expected: JSON with point count > 0
+    -H "Authorization: Bearer <TOKEN>"
+# Expected: JSON with total_chunks > 0
+```
+```bash
+# Live MCP log (Ctrl-C to stop)
+tail -f /var/log/pkp/mcp.log
 ```
 
 ---
@@ -343,6 +373,11 @@ so explicitly. Otherwise, the steps above are sufficient.
 | `index_status` returns 0 points | First full index never ran — see step 10 |
 | `docker compose up -d` says "permission denied" on docker socket | `marcvista` user is not in the `docker` group for this session. Fix: log out completely and log back in, or run `exit` to root then `usermod -aG docker marcvista`, then `su - marcvista`. Verify with `groups` — `docker` must appear. |
 | `Failed to enable unit: Unit file caddy.service does not exist` | Caddy was not installed yet when `install.sh` ran. Install it first (step 4c), then re-run `sudo systemctl enable --now caddy`. If `apt install caddy` asks about the Caddyfile conflict, choose **N** to keep the version that `install.sh` already wrote. |
+| `pkp-mcp.service` fails with `ModuleNotFoundError: No module named 'slowapi'` | `slowapi` was missing from the venv. Run `pip install slowapi==0.1.9` then `sudo systemctl restart pkp-mcp.service`. |
+| `pkp-mcp.service` fails with `ModuleNotFoundError: No module named 'mcp'` | MCP SDK missing. Run `pip install mcp==1.9.0` then `sudo systemctl restart pkp-mcp.service`. |
+| `pkp-mcp.service` fails with any other `ModuleNotFoundError` | A dependency is missing. Re-run `pip install -r requirements.txt` inside the venv, then restart the service. |
+| Indexer crashes with `504 Server Error: Gateway Timeout` from `graph.microsoft.com` | OneDrive's Graph API timed out while listing a large folder. The current code retries automatically with exponential backoff (up to 6 attempts). If it still fails, just re-run `python -m ingestion.runner --full` — the content-hash deduplication means already-indexed files are skipped. |
+| `sudo: marcvista is not in the sudoers file` | The `usermod -aG sudo` was applied but the session predates it. Log out fully (`exit` from the SSH session, then reconnect via `ssh marcvista@<SERVER_IP>`) and try again. |
 
 Logs:
 
