@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -223,9 +224,9 @@ def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
             vector=c.vector,
             payload=payload,
         ))
-    # Batch upsert in groups of 100
-    for i in range(0, len(points), 100):
-        client.upsert(collection_name=COLLECTION, points=points[i:i + 100])
+    # Batch upsert in groups of 500
+    for i in range(0, len(points), 500):
+        client.upsert(collection_name=COLLECTION, points=points[i:i + 500])
 
 # ── Core: process one file ────────────────────────────────────────────────────
 
@@ -364,8 +365,7 @@ def run_full(force: bool = False) -> None:
     total = len(supported)
     log.info("OneDrive full: found %d supported files", total)
 
-    results = []
-    for item in supported:
+    def _process_item(item: dict) -> dict:
         local_path = None
         try:
             file_name  = item["name"]
@@ -373,9 +373,8 @@ def run_full(force: bool = False) -> None:
             od_path    = item.get("parentReference", {}).get("path", "") + "/" + file_name
             ext        = Path(file_name).suffix.lower()
             if ext not in SUPPORTED_EXTS:
-                continue
+                return {"file": file_name, "status": "skipped", "chunks": 0, "error": None}
 
-            # Prefix with file_id to avoid name collisions for same-named files in different folders
             local_path = str(WORK_DIR / f"{file_id}_{file_name}")
             _download_to(token, file_id, local_path)
 
@@ -387,7 +386,7 @@ def run_full(force: bool = False) -> None:
             )
             author = (item.get("createdBy") or {}).get("user", {}).get("displayName")
 
-            result = process_file(
+            return process_file(
                 client,
                 local_path,
                 onedrive_item_id=file_id,
@@ -398,14 +397,19 @@ def run_full(force: bool = False) -> None:
                 author=author,
                 force=force,
             )
-            results.append(result)
-
         except Exception as e:
             log.error("DOWNLOAD ERROR  %s: %s", item.get("name"), e)
-            results.append({"file": item.get("name"), "status": "error", "chunks": 0, "error": str(e)})
+            return {"file": item.get("name"), "status": "error", "chunks": 0, "error": str(e)}
         finally:
             if local_path and Path(local_path).exists():
                 Path(local_path).unlink()
+
+    results = []
+    # 8 workers: enough to saturate download + embed pipeline on CPX62 without OOM
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_process_item, item): item for item in supported}
+        for future in as_completed(futures):
+            results.append(future.result())
 
     _print_summary(results, total_files=total)
 

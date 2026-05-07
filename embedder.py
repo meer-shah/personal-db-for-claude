@@ -1,7 +1,7 @@
 from sentence_transformers import SentenceTransformer
 
 _MODEL_NAME = "all-MiniLM-L6-v2"
-_BATCH_SIZE = 32
+_BATCH_SIZE = 64
 
 _model: SentenceTransformer | None = None
 
