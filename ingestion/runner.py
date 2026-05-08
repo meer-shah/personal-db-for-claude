@@ -363,7 +363,14 @@ def run_full(force: bool = False) -> None:
     Uses a shared TokenManager so the ~60-min Graph token TTL doesn't kill
     long runs — concurrent expiry triggers exactly one refresh thanks to
     the manager's lock + double-checked-locking pattern.
+
+    Handles SIGINT (Ctrl+C) and SIGTERM gracefully: the enumeration loop
+    breaks at the next iteration, in-flight work is cancelled, and a
+    summary of completed files is written before exiting. Content-hash
+    dedup makes restart safe — already-indexed files are skipped.
     """
+    import signal
+    import threading
     from onedrive import TokenManager
 
     exclusions = _load_exclusions()
@@ -378,6 +385,31 @@ def run_full(force: bool = False) -> None:
             pass
 
     tm = TokenManager()
+
+    # Graceful shutdown flag. Set by SIGINT/SIGTERM; checked in the
+    # enumeration loop so Ctrl+C actually stops the indexer instead of
+    # waiting for all 491k files to enumerate.
+    stop_event = threading.Event()
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _shutdown_handler(signum, _frame):
+        if not stop_event.is_set():
+            log.warning(
+                "Received signal %d — stopping enumeration; "
+                "in-flight files will finish, queued work will be cancelled. "
+                "Restart is safe (content-hash dedup will skip already-indexed files).",
+                signum,
+            )
+            stop_event.set()
+        else:
+            log.warning("Second signal %d — forcing exit", signum)
+            # Restore default handler so a third Ctrl+C definitely kills us.
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
 
     def _process_item(item: dict) -> dict:
         local_path = None
@@ -437,6 +469,10 @@ def run_full(force: bool = False) -> None:
 
     try:
         for item in _stream_all_files(tm):
+            if stop_event.is_set():
+                log.info("Stop requested — breaking enumeration loop")
+                break
+
             seen_count += 1
             if _is_excluded(item.get("name", ""), exclusions):
                 skipped_count += 1
@@ -457,6 +493,8 @@ def run_full(force: bool = False) -> None:
                     # Nothing done yet — yield the GIL briefly and retry.
                     import time as _time
                     _time.sleep(0.05)
+                if stop_event.is_set():
+                    break
 
             # Periodic progress log.
             if seen_count % 1000 == 0:
@@ -465,16 +503,26 @@ def run_full(force: bool = False) -> None:
                     seen_count, len(futures), skipped_count,
                 )
 
-        log.info(
-            "Enumeration complete: %d files seen, %d submitted, %d excluded",
-            seen_count, submitted_count, skipped_count,
-        )
+        if not stop_event.is_set():
+            log.info(
+                "Enumeration complete: %d files seen, %d submitted, %d excluded",
+                seen_count, submitted_count, skipped_count,
+            )
 
-        # Drain remaining in-flight futures.
+        # Drain remaining in-flight futures (or those still running after stop).
         for future in as_completed(futures):
-            results.append(future.result())
+            try:
+                results.append(future.result())
+            except Exception as e:
+                log.error("Future failed during drain: %s", e)
     finally:
-        process_pool.shutdown(wait=True)
+        # cancel_futures=True drops anything still queued; wait=True lets
+        # currently-running tasks finish so they commit cleanly to Qdrant.
+        process_pool.shutdown(wait=True, cancel_futures=True)
+        # Restore previous signal handlers so this doesn't leak across runs
+        # in the same process (e.g. test harnesses).
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
 
     _print_summary(results, total_files=submitted_count)
 
