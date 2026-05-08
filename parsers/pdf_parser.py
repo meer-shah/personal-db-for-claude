@@ -66,4 +66,11 @@ def parse_pdf(file_path: str) -> list[dict]:
             if page_text and page_text.strip():
                 chunks.append({"type": "text", "text": page_text.strip(), "page": page_num})
 
+            # Drop pdfplumber's per-page cache (_objects, _layout, _edges, …)
+            # before moving to the next page. Without this, large PDFs hold
+            # every page's parsed object tree in memory until the function
+            # returns — which under threaded load adds up to GiBs of RSS
+            # because Python's GC runs less aggressively under contention.
+            page.flush_cache()
+
     return chunks
