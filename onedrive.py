@@ -1,4 +1,7 @@
+import logging
 import os
+import threading
+import time
 from pathlib import Path
 import msal
 import requests
@@ -9,6 +12,8 @@ load_dotenv(ENV_FILE)
 
 AUTHORITY    = "https://login.microsoftonline.com/common"
 SCOPE        = ["Files.ReadWrite.All"]
+
+log = logging.getLogger("onedrive")
 
 # ── Authentication (Device Code Flow) ────────────────────────────────────────
 
@@ -55,6 +60,99 @@ def get_access_token() -> str:
         print("[OK] Refresh token stored in .env")
 
     return result["access_token"]
+
+# ── TokenManager: long-running access-token refresh ──────────────────────────
+#
+# Microsoft Graph access tokens for personal accounts last ~60-90 minutes,
+# but indexing a 1 TB OneDrive library can take many hours. The original
+# `get_access_token()` is fine for short scripts (it returns a single string),
+# but a long ingestion run that captures one token at startup will start
+# 401-ing on every request once the token expires mid-run.
+#
+# `TokenManager` solves that: it caches the current access token, refreshes
+# it proactively before expiry, and exposes a `force_refresh()` for callers
+# who hit a 401 anyway. It is thread-safe so multiple ingestion workers can
+# share a single instance without dog-piling the refresh.
+#
+# Usage in ingestion.runner:
+#     tm = TokenManager()
+#     headers = {"Authorization": f"Bearer {tm.get()}"}
+#     # on 401:
+#     tm.force_refresh()
+
+class TokenManager:
+    """Thread-safe Graph access-token holder with automatic refresh."""
+
+    # Refresh proactively this many seconds before the token expires.
+    _REFRESH_LEEWAY_S = 5 * 60        # 5 minutes
+    # Fallback expiry if MSAL doesn't report one (it usually does).
+    _DEFAULT_TTL_S    = 55 * 60       # 55 minutes
+
+    def __init__(self) -> None:
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+        self._lock = threading.Lock()
+        self._app: msal.PublicClientApplication | None = None
+
+    def get(self) -> str:
+        """Return a valid access token, refreshing if it is near expiry."""
+        if self._needs_refresh():
+            with self._lock:
+                # Double-checked: another thread may have refreshed while we waited.
+                if self._needs_refresh():
+                    self._refresh()
+        return self._token  # type: ignore[return-value]
+
+    def force_refresh(self) -> str:
+        """Force a refresh now — call after a 401 from Graph."""
+        with self._lock:
+            self._refresh()
+        return self._token  # type: ignore[return-value]
+
+    def _needs_refresh(self) -> bool:
+        return (
+            self._token is None
+            or time.time() >= self._expires_at - self._REFRESH_LEEWAY_S
+        )
+
+    def _refresh(self) -> None:
+        # Re-load .env each refresh so a rotated refresh token written by a
+        # previous refresh is picked up.
+        load_dotenv(ENV_FILE, override=True)
+        client_id     = os.getenv("ONEDRIVE_CLIENT_ID")
+        refresh_token = os.getenv("ONEDRIVE_REFRESH_TOKEN")
+        if not client_id:
+            raise RuntimeError("ONEDRIVE_CLIENT_ID is not set in .env")
+        if not refresh_token:
+            raise RuntimeError(
+                "ONEDRIVE_REFRESH_TOKEN missing — run `python onedrive.py` once "
+                "to seed it via the device-code flow."
+            )
+
+        if self._app is None:
+            self._app = msal.PublicClientApplication(
+                client_id=client_id, authority=AUTHORITY
+            )
+
+        result = self._app.acquire_token_by_refresh_token(
+            refresh_token, scopes=SCOPE
+        )
+        if "access_token" not in result:
+            raise RuntimeError(
+                f"Token refresh failed: {result.get('error_description', result)}"
+            )
+
+        self._token = result["access_token"]
+        ttl = int(result.get("expires_in") or self._DEFAULT_TTL_S)
+        self._expires_at = time.time() + ttl
+
+        # Microsoft rotates the refresh token on each use — persist the new one
+        # so the next process start can authenticate silently.
+        new_refresh = result.get("refresh_token")
+        if new_refresh and new_refresh != refresh_token:
+            set_key(ENV_FILE, "ONEDRIVE_REFRESH_TOKEN", new_refresh)
+        log.info("Graph access token refreshed (TTL %ds)", ttl)
+
 
 # ── Graph API helpers ─────────────────────────────────────────────────────────
 

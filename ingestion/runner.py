@@ -359,15 +359,19 @@ def run_full(force: bool = False) -> None:
 
     This means chunks start landing in Qdrant within minutes, instead of
     waiting hours for full enumeration to finish before any work begins.
+
+    Uses a shared TokenManager so the ~60-min Graph token TTL doesn't kill
+    long runs — concurrent expiry triggers exactly one refresh thanks to
+    the manager's lock + double-checked-locking pattern.
     """
-    from onedrive import get_access_token
+    from onedrive import TokenManager
 
     exclusions = _load_exclusions()
     client = _get_qdrant()
     _ensure_collection(client)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    token = get_access_token()
+    tm = TokenManager()
 
     def _process_item(item: dict) -> dict:
         local_path = None
@@ -380,7 +384,7 @@ def run_full(force: bool = False) -> None:
                 return {"file": file_name, "status": "skipped", "chunks": 0, "error": None}
 
             local_path = str(WORK_DIR / f"{file_id}_{file_name}")
-            _download_to(token, file_id, local_path)
+            _download_to(tm, file_id, local_path)
 
             modified = datetime.fromisoformat(
                 item.get("lastModifiedDateTime", datetime.now(tz=timezone.utc).isoformat())
@@ -420,7 +424,7 @@ def run_full(force: bool = False) -> None:
     log.info("OneDrive full (streaming): enumeration + processing run concurrently")
 
     try:
-        for item in _stream_all_files(token):
+        for item in _stream_all_files(tm):
             seen_count += 1
             if _is_excluded(item.get("name", ""), exclusions):
                 skipped_count += 1
@@ -451,16 +455,15 @@ def run_full(force: bool = False) -> None:
 def run_delta() -> None:
     """Index only files changed since last delta run."""
     import requests as req_lib
-    from onedrive import get_access_token
+    from onedrive import TokenManager
 
     exclusions = _load_exclusions()
     client = _get_qdrant()
     _ensure_collection(client)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    token   = get_access_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    GRAPH   = "https://graph.microsoft.com/v1.0"
+    tm    = TokenManager()
+    GRAPH = "https://graph.microsoft.com/v1.0"
 
     delta_token = None
     if DELTA_TOKEN_FILE.exists():
@@ -472,11 +475,22 @@ def run_delta() -> None:
         else f"{GRAPH}/me/drive/root/delta(token='{delta_token}')"
     )
 
+    def _delta_get(u: str) -> dict:
+        # Pull fresh auth header per request and retry once on 401.
+        for attempt in range(2):
+            headers = {"Authorization": f"Bearer {tm.get()}"}
+            resp = req_lib.get(u, headers=headers, timeout=60)
+            if resp.status_code == 401 and attempt == 0:
+                log.warning("Graph 401 on delta paging — refreshing token")
+                tm.force_refresh()
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        raise RuntimeError(f"Graph delta failed after token refresh: {u}")
+
     items = []
     while url:
-        resp = req_lib.get(url, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _delta_get(url)
         items.extend(data.get("value", []))
         url = data.get("@odata.nextLink")
         if "@odata.deltaLink" in data:
@@ -503,7 +517,7 @@ def run_delta() -> None:
             file_id    = item["id"]
             od_path    = item.get("parentReference", {}).get("path", "") + "/" + file_name
             local_path = str(WORK_DIR / f"{file_id}_{file_name}")
-            _download_to(token, file_id, local_path)
+            _download_to(tm, file_id, local_path)
 
             modified = datetime.fromisoformat(item.get("lastModifiedDateTime", datetime.now(tz=timezone.utc).isoformat()))
             created  = datetime.fromisoformat(item.get("createdDateTime", modified.isoformat()))
@@ -532,16 +546,27 @@ def run_delta() -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _graph_get_with_retry(url: str, headers: dict, max_attempts: int = 6) -> dict:
+def _graph_get_with_retry(url: str, tm, max_attempts: int = 6) -> dict:
     """
-    Shared Graph GET with exponential backoff for 429/5xx and network errors.
-    Used by both the (legacy) blocking enumerator and the streaming enumerator.
+    Shared Graph GET with exponential backoff for 429/5xx and network errors,
+    plus 401 handling via TokenManager.force_refresh().
+
+    `tm` is a TokenManager instance (from onedrive.py). The auth header is
+    rebuilt per attempt so a refresh mid-loop takes effect immediately.
     """
     import time
     import requests as req_lib
     for attempt in range(max_attempts):
+        headers = {"Authorization": f"Bearer {tm.get()}"}
         try:
             resp = req_lib.get(url, headers=headers, timeout=60)
+            if resp.status_code == 401:
+                log.warning(
+                    "Graph 401 on %s — refreshing token (attempt %d/%d)",
+                    url[:80], attempt + 1, max_attempts,
+                )
+                tm.force_refresh()
+                continue
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait = int(resp.headers.get("Retry-After", 2 ** attempt))
                 log.warning(
@@ -562,19 +587,19 @@ def _graph_get_with_retry(url: str, headers: dict, max_attempts: int = 6) -> dic
     raise RuntimeError(f"Graph API failed after {max_attempts} attempts: {url}")
 
 
-def _collect_all_files(token: str) -> list[dict]:
+def _collect_all_files(tm) -> list[dict]:
     """
     Legacy blocking enumerator. Kept for backward compatibility; run_full()
     now uses _stream_all_files() instead so processing can start before
     enumeration finishes. Still useful for tests or short ad-hoc runs.
+    Takes a TokenManager instance.
     """
     GRAPH   = "https://graph.microsoft.com/v1.0"
-    headers = {"Authorization": f"Bearer {token}"}
     results = []
 
     def _recurse(url: str) -> None:
         while url:
-            data = _graph_get_with_retry(url, headers)
+            data = _graph_get_with_retry(url, tm)
             for item in data.get("value", []):
                 if "folder" in item:
                     child_url = f"{GRAPH}/me/drive/items/{item['id']}/children"
@@ -590,7 +615,7 @@ def _collect_all_files(token: str) -> list[dict]:
     return results
 
 
-def _stream_all_files(token: str, num_walkers: int = 4):
+def _stream_all_files(tm, num_walkers: int = 4):
     """
     Streaming enumerator. Walks OneDrive folders with a thread pool of
     `num_walkers` workers and yields file metadata dicts as they are
@@ -606,12 +631,14 @@ def _stream_all_files(token: str, num_walkers: int = 4):
     Why 4 walkers (not more): Microsoft Graph throttles aggressive
     enumeration. 4 concurrent folder pages is the empirical sweet spot —
     cuts a 17-hour serial walk to ~3-4 hours without triggering 429s.
+
+    Takes a TokenManager so long-running enumeration survives the ~60-min
+    Graph access-token TTL via automatic refresh.
     """
     import queue
     import threading
 
-    GRAPH   = "https://graph.microsoft.com/v1.0"
-    headers = {"Authorization": f"Bearer {token}"}
+    GRAPH = "https://graph.microsoft.com/v1.0"
 
     # Folders still to walk. Pagination links count as folder URLs too.
     folder_queue: "queue.Queue[str | None]" = queue.Queue()
@@ -647,7 +674,7 @@ def _stream_all_files(token: str, num_walkers: int = 4):
                 folder_queue.task_done()
                 return
             try:
-                data = _graph_get_with_retry(url, headers)
+                data = _graph_get_with_retry(url, tm)
                 for item in data.get("value", []):
                     if "folder" in item:
                         child_url = (
@@ -695,14 +722,27 @@ def _stream_all_files(token: str, num_walkers: int = 4):
         t.join(timeout=5.0)
 
 
-def _download_to(token: str, file_id: str, local_path: str) -> None:
+def _download_to(tm, file_id: str, local_path: str) -> None:
+    """
+    Download a file from OneDrive. Takes a TokenManager so long ingest runs
+    survive the ~60-min access-token TTL. Retries once on 401 by forcing
+    a token refresh; other errors propagate.
+    """
     import requests as req_lib
-    GRAPH   = "https://graph.microsoft.com/v1.0"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp    = req_lib.get(f"{GRAPH}/me/drive/items/{file_id}/content", headers=headers)
-    resp.raise_for_status()
-    with open(local_path, "wb") as f:
-        f.write(resp.content)
+    GRAPH = "https://graph.microsoft.com/v1.0"
+    url   = f"{GRAPH}/me/drive/items/{file_id}/content"
+    for attempt in range(2):
+        headers = {"Authorization": f"Bearer {tm.get()}"}
+        resp = req_lib.get(url, headers=headers, timeout=300)
+        if resp.status_code == 401 and attempt == 0:
+            log.warning("Graph 401 on download %s — refreshing token", file_id)
+            tm.force_refresh()
+            continue
+        resp.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+        return
+    raise RuntimeError(f"Download failed for {file_id} after token refresh")
 
 
 def _print_summary(results: list[dict], total_files: int = 0) -> None:
