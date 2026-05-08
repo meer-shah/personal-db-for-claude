@@ -415,9 +415,15 @@ def run_full(force: bool = False) -> None:
     results = []
     seen_count = 0
     skipped_count = 0
+    submitted_count = 0
 
-    # 12 download/process workers. Sized for CPX62 (16 vCPU, 32 GB RAM):
-    # leaves ~20 GB headroom over OS + Qdrant + embedding model + per-worker peaks.
+    # Max in-flight futures before we pause enumeration and drain.
+    # Each future holds ~a few MB (downloaded bytes + chunks). 48 in-flight
+    # across 12 workers = ~4 tasks queued per worker — enough to keep all
+    # workers busy without accumulating the entire 491k-file list in RAM.
+    MAX_IN_FLIGHT = 48
+
+    # 12 download/process workers. Sized for CPX62 (16 vCPU, 32 GB RAM).
     process_pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="proc")
     futures: list = []
 
@@ -429,20 +435,36 @@ def run_full(force: bool = False) -> None:
             if _is_excluded(item.get("name", ""), exclusions):
                 skipped_count += 1
                 continue
-            futures.append(process_pool.submit(_process_item, item))
 
-            # Periodic progress so the operator can see enumeration is alive.
+            futures.append(process_pool.submit(_process_item, item))
+            submitted_count += 1
+
+            # Drain completed futures whenever the in-flight window fills up.
+            # This keeps memory bounded — we never queue more than MAX_IN_FLIGHT
+            # items ahead of the workers regardless of how fast enumeration runs.
+            while len(futures) >= MAX_IN_FLIGHT:
+                done_futures = [f for f in futures if f.done()]
+                for f in done_futures:
+                    results.append(f.result())
+                    futures.remove(f)
+                if not done_futures:
+                    # Nothing done yet — yield the GIL briefly and retry.
+                    import time as _time
+                    _time.sleep(0.05)
+
+            # Periodic progress log.
             if seen_count % 1000 == 0:
                 log.info(
-                    "Enumerated %d files so far (%d queued, %d excluded)",
+                    "Enumerated %d files so far (%d in-flight, %d excluded)",
                     seen_count, len(futures), skipped_count,
                 )
 
         log.info(
-            "Enumeration complete: %d files seen, %d queued for processing, %d excluded",
-            seen_count, len(futures), skipped_count,
+            "Enumeration complete: %d files seen, %d submitted, %d excluded",
+            seen_count, submitted_count, skipped_count,
         )
 
+        # Drain remaining in-flight futures.
         for future in as_completed(futures):
             results.append(future.result())
     finally:
