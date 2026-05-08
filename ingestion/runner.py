@@ -459,13 +459,22 @@ def run_full(force: bool = False) -> None:
     # Each future holds ~a few MB (downloaded bytes + chunks). 48 in-flight
     # across 12 workers = ~4 tasks queued per worker — enough to keep all
     # workers busy without accumulating the entire 491k-file list in RAM.
-    MAX_IN_FLIGHT = 48
+    # Worker count is tunable via PKP_INGEST_WORKERS. Default 12 is sized
+    # for CPX62 (16 vCPU, 32 GB RAM). If RSS grows too fast in production,
+    # lower this (e.g. PKP_INGEST_WORKERS=6) to halve the per-thread
+    # allocator footprint inside the embedder. MAX_IN_FLIGHT scales with it
+    # so the in-flight window stays at ~4× workers.
+    workers = int(os.getenv("PKP_INGEST_WORKERS", "12"))
+    MAX_IN_FLIGHT = workers * 4
 
-    # 12 download/process workers. Sized for CPX62 (16 vCPU, 32 GB RAM).
-    process_pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="proc")
+    process_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="proc")
     futures: list = []
 
-    log.info("OneDrive full (streaming): enumeration + processing run concurrently")
+    log.info(
+        "OneDrive full (streaming): enumeration + processing run concurrently "
+        "(workers=%d, max_in_flight=%d)",
+        workers, MAX_IN_FLIGHT,
+    )
 
     try:
         for item in _stream_all_files(tm):
