@@ -52,7 +52,7 @@ load_dotenv(REPO_ROOT / ".env")
 COLLECTION       = "pkp_chunks"
 VECTOR_SIZE      = 384
 SUPPORTED_EXTS   = {".docx", ".pdf", ".xlsx", ".pptx", ".txt", ".md", ".csv"}
-WORK_DIR         = Path("/tmp/pkp_work")
+WORK_DIR         = Path("/var/pkp/work")
 DELTA_TOKEN_FILE = Path("/var/pkp/delta_token.json")
 EXCLUSIONS_FILE  = REPO_ROOT / "config" / "exclusions.txt"
 
@@ -370,6 +370,12 @@ def run_full(force: bool = False) -> None:
     client = _get_qdrant()
     _ensure_collection(client)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    # Clean up any leftover temp files from a previous crashed run.
+    for f in WORK_DIR.glob("*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
 
     tm = TokenManager()
 
@@ -470,7 +476,7 @@ def run_full(force: bool = False) -> None:
     finally:
         process_pool.shutdown(wait=True)
 
-    _print_summary(results, total_files=len(futures))
+    _print_summary(results, total_files=submitted_count)
 
 # ── OneDrive delta mode ───────────────────────────────────────────────────────
 
@@ -483,6 +489,11 @@ def run_delta() -> None:
     client = _get_qdrant()
     _ensure_collection(client)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    for f in WORK_DIR.glob("*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
 
     tm    = TokenManager()
     GRAPH = "https://graph.microsoft.com/v1.0"
@@ -511,6 +522,7 @@ def run_delta() -> None:
         raise RuntimeError(f"Graph delta failed after token refresh: {u}")
 
     items = []
+    new_token = None
     while url:
         data = _delta_get(url)
         items.extend(data.get("value", []))
@@ -518,9 +530,6 @@ def run_delta() -> None:
         if "@odata.deltaLink" in data:
             delta_link = data["@odata.deltaLink"]
             new_token  = delta_link.split("token='")[1].rstrip("'") if "token='" in delta_link else None
-            if new_token:
-                DELTA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-                DELTA_TOKEN_FILE.write_text(json.dumps({"token": new_token}))
             break
 
     supported = [
@@ -565,6 +574,12 @@ def run_delta() -> None:
                 Path(local_path).unlink()
 
     _print_summary(results, total_files=len(supported))
+
+    # Save delta token only after all files processed successfully.
+    # Saving it before processing risks permanently skipping files if the run crashes mid-way.
+    if new_token:
+        DELTA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DELTA_TOKEN_FILE.write_text(json.dumps({"token": new_token}))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
