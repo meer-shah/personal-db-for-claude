@@ -482,7 +482,6 @@ def run_full(force: bool = False) -> None:
 
 def run_delta() -> None:
     """Index only files changed since last delta run."""
-    import requests as req_lib
     from onedrive import TokenManager
 
     exclusions = _load_exclusions()
@@ -508,11 +507,13 @@ def run_delta() -> None:
         else f"{GRAPH}/me/drive/root/delta(token='{delta_token}')"
     )
 
+    session = _get_http_session()
+
     def _delta_get(u: str) -> dict:
         # Pull fresh auth header per request and retry once on 401.
         for attempt in range(2):
             headers = {"Authorization": f"Bearer {tm.get()}"}
-            resp = req_lib.get(u, headers=headers, timeout=60)
+            resp = session.get(u, headers=headers, timeout=60)
             if resp.status_code == 401 and attempt == 0:
                 log.warning("Graph 401 on delta paging — refreshing token")
                 tm.force_refresh()
@@ -581,6 +582,41 @@ def run_delta() -> None:
         DELTA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         DELTA_TOKEN_FILE.write_text(json.dumps({"token": new_token}))
 
+# ── HTTP session ──────────────────────────────────────────────────────────────
+
+_http_session = None
+_http_session_lock = None
+
+
+def _get_http_session():
+    """
+    Single shared requests.Session for all Graph + download calls.
+
+    Without this, every req_lib.get() opens a fresh TCP+TLS connection. memray
+    showed urllib3.ssl_wrap_socket as the #1 allocation source (~5.4 GB,
+    147M allocations) during a 5-min profile — every Graph hit was paying full
+    handshake cost. A pooled Session reuses keep-alive connections per host,
+    eliminating that allocation thrash.
+
+    The pool sizes (16 connections, 32 max) are sized for our 12-worker +
+    4-walker concurrency with headroom. requests.Session is thread-safe for
+    concurrent .get() calls (urllib3 PoolManager is internally locked).
+    """
+    global _http_session, _http_session_lock
+    import threading
+    if _http_session_lock is None:
+        _http_session_lock = threading.Lock()
+    with _http_session_lock:
+        if _http_session is None:
+            import requests as req_lib
+            from requests.adapters import HTTPAdapter
+            _http_session = req_lib.Session()
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32)
+            _http_session.mount("https://", adapter)
+            _http_session.mount("http://", adapter)
+    return _http_session
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _graph_get_with_retry(url: str, tm, max_attempts: int = 6) -> dict:
@@ -593,10 +629,11 @@ def _graph_get_with_retry(url: str, tm, max_attempts: int = 6) -> dict:
     """
     import time
     import requests as req_lib
+    session = _get_http_session()
     for attempt in range(max_attempts):
         headers = {"Authorization": f"Bearer {tm.get()}"}
         try:
-            resp = req_lib.get(url, headers=headers, timeout=60)
+            resp = session.get(url, headers=headers, timeout=60)
             if resp.status_code == 401:
                 log.warning(
                     "Graph 401 on %s — refreshing token (attempt %d/%d)",
@@ -765,20 +802,24 @@ def _download_to(tm, file_id: str, local_path: str) -> None:
     survive the ~60-min access-token TTL. Retries once on 401 by forcing
     a token refresh; other errors propagate.
     """
-    import requests as req_lib
     GRAPH = "https://graph.microsoft.com/v1.0"
     url   = f"{GRAPH}/me/drive/items/{file_id}/content"
+    session = _get_http_session()
     for attempt in range(2):
         headers = {"Authorization": f"Bearer {tm.get()}"}
-        resp = req_lib.get(url, headers=headers, timeout=300)
-        if resp.status_code == 401 and attempt == 0:
-            log.warning("Graph 401 on download %s — refreshing token", file_id)
-            tm.force_refresh()
-            continue
-        resp.raise_for_status()
-        with open(local_path, "wb") as f:
-            f.write(resp.content)
-        return
+        # stream=True so we don't materialize the full response body in RAM
+        # before writing — important for large PDFs/PPTX in a 1TB library.
+        with session.get(url, headers=headers, timeout=300, stream=True) as resp:
+            if resp.status_code == 401 and attempt == 0:
+                log.warning("Graph 401 on download %s — refreshing token", file_id)
+                tm.force_refresh()
+                continue
+            resp.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            return
     raise RuntimeError(f"Download failed for {file_id} after token refresh")
 
 
