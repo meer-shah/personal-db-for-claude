@@ -52,7 +52,10 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Search the user's personal knowledge base for documents relevant to a query. "
                 "Returns ranked text chunks with source file metadata. "
-                "Use this to answer questions about the user's files and documents."
+                "Use this to answer questions about the user's files and documents. "
+                "For 'compare these N documents on topic X' queries, pass file_paths to "
+                "scope the search to just those files — much more efficient than fetching "
+                "each full document with get_document."
             ),
             inputSchema={
                 "type": "object",
@@ -64,6 +67,12 @@ async def list_tools() -> list[Tool]:
                     "author_filter":    {"type": "string",  "description": "Filter by author (substring match)"},
                     "date_from":        {"type": "string",  "description": "Only docs modified after this ISO date e.g. 2024-01-01"},
                     "date_to":          {"type": "string",  "description": "Only docs modified before this ISO date e.g. 2024-12-31"},
+                    "file_paths":       {
+                        "type":  "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict search to chunks within these specific file_paths (up to 20). Use file_path values returned from a prior search. Ideal for multi-document comparisons.",
+                        "maxItems": 20,
+                    },
                 },
                 "required": ["query"],
             },
