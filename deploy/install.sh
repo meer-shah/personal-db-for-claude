@@ -31,7 +31,7 @@ echo "→ App dir: $APP_DIR"
 echo "→ Domain:  $PKP_DOMAIN"
 
 # systemd units
-for unit in pkp-mcp.service pkp-indexer.service; do
+for unit in pkp-mcp.service pkp-indexer.service pkp-full-indexer.service; do
     sed -e "s|<USER>|$RUN_USER|g" -e "s|<APP_DIR>|$APP_DIR|g" \
         "$APP_DIR/deploy/systemd/$unit.template" \
         > "/etc/systemd/system/$unit"

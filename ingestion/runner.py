@@ -56,6 +56,15 @@ WORK_DIR         = Path("/var/pkp/work")
 DELTA_TOKEN_FILE = Path("/var/pkp/delta_token.json")
 EXCLUSIONS_FILE  = REPO_ROOT / "config" / "exclusions.txt"
 
+# Bad-file quarantine: persistent ledger of files that have repeatedly failed
+# the parser/chunker/embedder. After QUARANTINE_THRESHOLD consecutive failures
+# we skip the file on subsequent runs instead of looping forever on it. The
+# ledger is keyed by onedrive_item_id so renames don't matter; if the user
+# re-saves the file (content_hash changes) we retry once in case they fixed
+# the corruption.
+QUARANTINE_FILE      = Path("/var/pkp/bad_files.json")
+QUARANTINE_THRESHOLD = 3
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -228,6 +237,99 @@ def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
     for i in range(0, len(points), 500):
         client.upsert(collection_name=COLLECTION, points=points[i:i + 500])
 
+# ── Bad-file quarantine ───────────────────────────────────────────────────────
+
+# Module-level cache + lock so concurrent workers see consistent state and
+# don't all hammer the disk. Loaded lazily on first access.
+_quarantine_cache: dict | None = None
+import threading as _threading
+_quarantine_lock = _threading.Lock()
+
+
+def _load_quarantine() -> dict:
+    """Read the quarantine ledger from disk (or return empty if missing)."""
+    global _quarantine_cache
+    with _quarantine_lock:
+        if _quarantine_cache is not None:
+            return _quarantine_cache
+        if QUARANTINE_FILE.exists():
+            try:
+                _quarantine_cache = json.loads(QUARANTINE_FILE.read_text())
+            except Exception as e:
+                log.warning("Could not parse quarantine file (%s) — starting fresh", e)
+                _quarantine_cache = {}
+        else:
+            _quarantine_cache = {}
+        return _quarantine_cache
+
+
+def _save_quarantine() -> None:
+    """Persist the quarantine ledger atomically (write to temp + rename)."""
+    if _quarantine_cache is None:
+        return
+    try:
+        QUARANTINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = QUARANTINE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_quarantine_cache, indent=2))
+        tmp.replace(QUARANTINE_FILE)
+    except Exception as e:
+        log.warning("Could not persist quarantine file: %s", e)
+
+
+def _is_quarantined(onedrive_item_id: str, content_hash: str | None = None) -> tuple[bool, dict | None]:
+    """
+    Return (skip_this_file, ledger_entry).
+
+    skip_this_file is True if the file has hit QUARANTINE_THRESHOLD consecutive
+    failures AND its content_hash matches the one we last failed on (so a
+    re-saved file gets a fresh chance).
+    """
+    ledger = _load_quarantine()
+    entry  = ledger.get(onedrive_item_id)
+    if not entry:
+        return (False, None)
+    if entry.get("fail_count", 0) < QUARANTINE_THRESHOLD:
+        return (False, entry)
+    # If user re-saved the file, allow a retry.
+    if content_hash and entry.get("content_hash") != content_hash:
+        return (False, entry)
+    return (True, entry)
+
+
+def _record_failure(onedrive_item_id: str, file_name: str, content_hash: str | None, error: str) -> int:
+    """Increment failure count for this file. Returns the new count."""
+    with _quarantine_lock:
+        ledger = _quarantine_cache if _quarantine_cache is not None else _load_quarantine()
+        now    = datetime.now(tz=timezone.utc).isoformat()
+        entry  = ledger.get(onedrive_item_id, {})
+
+        # If the content_hash changed since the last failure, this is a "new"
+        # version of the file — reset the count rather than carrying old failures.
+        if content_hash and entry.get("content_hash") and entry["content_hash"] != content_hash:
+            entry = {}
+
+        entry.update({
+            "file_name":    file_name,
+            "content_hash": content_hash,
+            "fail_count":   entry.get("fail_count", 0) + 1,
+            "first_seen":   entry.get("first_seen", now),
+            "last_attempt": now,
+            "last_error":   error[:500],   # cap to avoid unbounded growth
+        })
+        ledger[onedrive_item_id] = entry
+        _save_quarantine()
+        return entry["fail_count"]
+
+
+def _clear_failure(onedrive_item_id: str) -> None:
+    """Remove a file from the quarantine ledger after a successful process."""
+    with _quarantine_lock:
+        ledger = _quarantine_cache if _quarantine_cache is not None else _load_quarantine()
+        if onedrive_item_id in ledger:
+            del ledger[onedrive_item_id]
+            _save_quarantine()
+
+
 # ── Core: process one file ────────────────────────────────────────────────────
 
 def process_file(
@@ -259,13 +361,31 @@ def process_file(
             log.info("SKIP  %s (unchanged)", file_name)
             return {"file": file_name, "status": "skipped", "chunks": 0, "error": None}
 
+    # Quarantine check — skip files that have repeatedly crashed the parser.
+    # Same-hash retries are skipped fast; if the user re-saved the file
+    # (different hash), _is_quarantined returns False and we try again.
+    quarantined, q_entry = _is_quarantined(onedrive_item_id, file_hash)
+    if quarantined and not force:
+        log.warning(
+            "SKIP-QUARANTINED  %s (failed %d times, last error: %s)",
+            file_name, q_entry.get("fail_count", 0), (q_entry.get("last_error") or "")[:120],
+        )
+        return {
+            "file": file_name, "status": "quarantined", "chunks": 0,
+            "error": f"quarantined after {q_entry.get('fail_count', 0)} failures: {q_entry.get('last_error', '')}",
+        }
+
     try:
         raw_chunks = _parse_file(local_path)
     except Exception as e:
-        log.error("PARSE ERROR  %s: %s", file_name, e)
+        n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}")
+        log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
         return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
     if not raw_chunks:
+        # Empty isn't a "bad file" — clear any stale failures (file may have
+        # been re-saved as legitimately empty).
+        _clear_failure(onedrive_item_id)
         log.info("EMPTY %s (no content extracted)", file_name)
         return {"file": file_name, "status": "empty", "chunks": 0, "error": None}
 
@@ -273,7 +393,8 @@ def process_file(
         chunked  = chunk_texts(raw_chunks)
         embedded = embed_chunks(chunked)
     except Exception as e:
-        log.error("CHUNK/EMBED ERROR  %s: %s", file_name, e)
+        n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}")
+        log.error("CHUNK/EMBED ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
         return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
     chunks: list[Chunk] = []
@@ -301,8 +422,13 @@ def process_file(
         _delete_item_chunks(client, onedrive_item_id)
         _upsert_chunks(client, chunks)
     except Exception as e:
+        # Qdrant errors are typically transient (network, server restart) —
+        # don't count them toward quarantine. The next run will retry.
         log.error("QDRANT ERROR  %s: %s", file_name, e)
         return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
+
+    # Successful end-to-end — clear any prior quarantine state for this file.
+    _clear_failure(onedrive_item_id)
 
     log.info("OK    %s → %d chunks", file_name, len(chunks))
     return {"file": file_name, "status": "ok", "chunks": len(chunks), "error": None}
@@ -881,19 +1007,28 @@ def _download_to(tm, file_id: str, local_path: str) -> None:
 
 
 def _print_summary(results: list[dict], total_files: int = 0) -> None:
-    ok      = sum(1 for r in results if r["status"] == "ok")
-    skipped = sum(1 for r in results if r["status"] == "skipped")
-    empty   = sum(1 for r in results if r["status"] == "empty")
-    errors  = [r for r in results if r["status"] == "error"]
+    ok           = sum(1 for r in results if r["status"] == "ok")
+    skipped      = sum(1 for r in results if r["status"] == "skipped")
+    empty        = sum(1 for r in results if r["status"] == "empty")
+    quarantined  = sum(1 for r in results if r["status"] == "quarantined")
+    errors       = [r for r in results if r["status"] == "error"]
     total_chunks = sum(r["chunks"] for r in results)
 
     log.info("─" * 60)
-    log.info("Summary: %d indexed, %d skipped, %d empty, %d errors", ok, skipped, empty, len(errors))
+    log.info(
+        "Summary: %d indexed, %d skipped, %d empty, %d quarantined, %d errors",
+        ok, skipped, empty, quarantined, len(errors),
+    )
     log.info("Total chunks upserted: %d", total_chunks)
     if errors:
-        log.warning("Failed files:")
+        log.warning("Failed files (this run):")
         for e in errors:
             log.warning("  %-40s %s", e["file"], e["error"])
+    if quarantined:
+        log.info(
+            "Quarantined files skipped this run: %d (see %s for details)",
+            quarantined, QUARANTINE_FILE,
+        )
 
     _write_status(ok, errors, total_files=total_files)
 
