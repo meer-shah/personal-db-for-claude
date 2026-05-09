@@ -17,6 +17,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
     MatchText,
     Range,
     SearchParams,
@@ -75,6 +76,14 @@ class SearchRequest(BaseModel):
     # Number of candidates to retrieve from Qdrant before reranking. Use ~50 for narrow lookups,
     # 150 for normal queries, up to 500 for broad/exploratory questions across a 1TB library.
 
+    # Scoped search: when set, only chunks belonging to one of these file_paths
+    # are considered. Use this for "compare these N documents" queries — Claude
+    # passes the file_paths returned from a prior search, and the next search
+    # is restricted to chunks within those files. Cap at 20 to keep the Qdrant
+    # filter fast (more than 20 docs at once is rarely a real comparison case
+    # and is usually better expressed as a folder_filter).
+    file_paths:        list[str] | None = Field(default=None, max_length=20)
+
 
 class SearchResult(BaseModel):
     text:          str   # the matched chunk merged with neighbouring chunks for context
@@ -132,6 +141,14 @@ def _build_filter(req: SearchRequest) -> Filter | None:
     if req.author_filter:
         conditions.append(
             FieldCondition(key="author", match=MatchText(text=req.author_filter))
+        )
+
+    # Scoped search: restrict to specific file_paths (exact match, any of N).
+    # MatchAny does an OR across the list — a chunk matches if its file_path
+    # equals any of the provided paths.
+    if req.file_paths:
+        conditions.append(
+            FieldCondition(key="file_path", match=MatchAny(any=req.file_paths))
         )
 
     # Date range — stored as unix epoch float (modified_date_ts) so Range works correctly

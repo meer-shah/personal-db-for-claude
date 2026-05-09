@@ -41,11 +41,17 @@ def search_documents(
     author_filter: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    file_paths: list[str] | None = None,
 ) -> str:
     """
     Search the knowledge base for documents relevant to a query.
     Returns ranked text chunks with source file metadata.
     Use this to answer questions about the user's files and documents.
+
+    For "compare these N documents on topic X" queries, pass file_paths to
+    scope the search to just those files. This is much more efficient than
+    calling get_document on each one — you get only the chunks relevant to
+    your query, not the full documents.
 
     Args:
         query: The search query
@@ -55,6 +61,9 @@ def search_documents(
         author_filter: Filter by document author name (substring match)
         date_from: Only include documents modified after this date (ISO format e.g. 2024-01-01)
         date_to: Only include documents modified before this date (ISO format e.g. 2024-12-31)
+        file_paths: Restrict search to chunks within these specific file_paths.
+                    Use file_path values returned from a prior search. Up to 20 files.
+                    Example: ["/drive/root:/A.pdf", "/drive/root:/B.pdf"] for a 2-doc comparison.
     """
     payload: dict[str, Any] = {"query": query, "top_k": top_k}
     if file_type_filter: payload["file_type_filter"] = file_type_filter
@@ -62,6 +71,7 @@ def search_documents(
     if author_filter:    payload["author_filter"]    = author_filter
     if date_from:        payload["date_from"]        = date_from
     if date_to:          payload["date_to"]          = date_to
+    if file_paths:       payload["file_paths"]       = file_paths
     return json.dumps(_http("POST", "/tools/search_documents", json=payload), ensure_ascii=False, indent=2)
 
 
