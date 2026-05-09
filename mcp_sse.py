@@ -55,7 +55,9 @@ def search_documents(
 
     Args:
         query: The search query
-        top_k: Number of results to return (1-15, default 5)
+        top_k: Number of results to return (1-100, default 5). Use higher values
+               (25-100) when the user wants in-depth coverage of a topic, especially
+               for multi-document comparisons. 5-10 is plenty for simple questions.
         file_type_filter: Filter by file type e.g. pdf, docx, xlsx, pptx
         folder_filter: Filter by folder path prefix e.g. /Projects/SAP
         author_filter: Filter by document author name (substring match)
@@ -73,6 +75,38 @@ def search_documents(
     if date_to:          payload["date_to"]          = date_to
     if file_paths:       payload["file_paths"]       = file_paths
     return json.dumps(_http("POST", "/tools/search_documents", json=payload), ensure_ascii=False, indent=2)
+
+
+@_mcp.tool()
+def list_files(
+    name_query: str,
+    file_type_filter: str | None = None,
+    folder_filter: str | None = None,
+    limit: int = 50,
+) -> str:
+    """
+    Find files in the knowledge base by name or path. Returns metadata only
+    (no chunk text), so the response is always small.
+
+    Use this to disambiguate when the user describes a file in natural
+    language ("my FYP SRS", "the budget spreadsheet") instead of giving you
+    an exact file_path. Show the matches to the user, get their confirmation
+    on which file(s) they meant, then call search_documents with file_paths
+    set to the confirmed paths.
+
+    For multi-document comparisons ("compare these N docs on X"), this is
+    the natural first step before search_documents(file_paths=[...]).
+
+    Args:
+        name_query:       Substring to match against file names and paths (case-insensitive).
+        file_type_filter: Restrict to a single file type, e.g. pdf, docx, xlsx.
+        folder_filter:    Restrict to file_paths containing this folder substring.
+        limit:            Max matches to return (1-50, default 50).
+    """
+    params: dict[str, Any] = {"name_query": name_query, "limit": limit}
+    if file_type_filter: params["file_type_filter"] = file_type_filter
+    if folder_filter:    params["folder_filter"]    = folder_filter
+    return json.dumps(_http("GET", "/tools/list_files", params=params), ensure_ascii=False, indent=2)
 
 
 @_mcp.tool()

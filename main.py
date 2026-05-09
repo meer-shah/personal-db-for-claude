@@ -21,6 +21,7 @@ load_dotenv(REPO_ROOT / ".env")
 from tools_mcp.search            import router as search_router
 from tools_mcp.get_document      import router as get_document_router
 from tools_mcp.index_status      import router as index_status_router
+from tools_mcp.list_files        import router as list_files_router
 from tools_mcp.create_word       import router as create_word_router
 from tools_mcp.create_excel      import router as create_excel_router
 from tools_mcp.create_powerpoint import router as create_ppt_router
@@ -49,6 +50,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(search_router)
 app.include_router(get_document_router)
 app.include_router(index_status_router)
+app.include_router(list_files_router)
 app.include_router(create_word_router)
 app.include_router(create_excel_router)
 app.include_router(create_ppt_router)
