@@ -78,12 +78,34 @@ def get_document(file_path: str) -> str:
 
 
 @_mcp.tool()
-def index_status() -> str:
+def index_status(
+    include_errors: bool = False,
+    errors_limit: int = 50,
+    errors_offset: int = 0,
+) -> str:
     """
     Check the current indexing status of the knowledge base.
-    Returns how many files are indexed, percentage complete, total chunks in Qdrant, and any errors.
+
+    By default returns a compact summary: counts, percentages, total Qdrant
+    chunks, and a small sample of recent errors (up to 5). The summary is
+    always small (well under 1 KB) so it fits any MCP client response cap.
+
+    For diagnostic deep-dives, set include_errors=true to get a paginated
+    slice of the full error list. Use errors_limit (1-200, default 50) and
+    errors_offset (default 0) to walk through pages.
+
+    Args:
+        include_errors: Return a paginated slice of the full error list.
+                        Default False — returns just a 5-error sample.
+        errors_limit:   Errors per page when include_errors=True (1-200).
+        errors_offset:  Pagination offset when include_errors=True.
     """
-    return json.dumps(_http("GET", "/tools/index_status"), ensure_ascii=False, indent=2)
+    params = {
+        "include_errors": "true" if include_errors else "false",
+        "errors_limit":   errors_limit,
+        "errors_offset":  errors_offset,
+    }
+    return json.dumps(_http("GET", "/tools/index_status", params=params), ensure_ascii=False, indent=2)
 
 
 @_mcp.tool()
