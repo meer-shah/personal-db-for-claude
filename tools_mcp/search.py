@@ -66,7 +66,10 @@ _setup_audit_log()
 
 class SearchRequest(BaseModel):
     query:             str
-    top_k:             int        = Field(default=5, ge=1, le=15)
+    # top_k cap raised from 15 to 100 so users can request deeper context for
+    # complex / multi-doc queries. Each chunk is ~3 KB after context expansion,
+    # so 100 chunks ≈ 300 KB — comfortably under the 1 MB MCP response cap.
+    top_k:             int        = Field(default=5, ge=1, le=100)
     file_type_filter:  str | None = None   # e.g. "docx", "pdf"
     folder_filter:     str | None = None   # prefix match on file_path
     author_filter:     str | None = None   # substring match on author

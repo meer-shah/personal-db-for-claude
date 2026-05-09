@@ -61,7 +61,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "query":            {"type": "string",  "description": "The search query"},
-                    "top_k":            {"type": "integer", "description": "Number of results (1-15)", "default": 5},
+                    "top_k":            {"type": "integer", "description": "Number of results (1-100, default 5). Use 25-100 for in-depth coverage / multi-document comparisons.", "default": 5},
                     "file_type_filter": {"type": "string",  "description": "Filter by file type e.g. pdf, docx, xlsx, pptx"},
                     "folder_filter":    {"type": "string",  "description": "Filter by folder path prefix e.g. /Projects"},
                     "author_filter":    {"type": "string",  "description": "Filter by author (substring match)"},
@@ -75,6 +75,27 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="list_files",
+            description=(
+                "Find files by name or path. Returns metadata only (no chunk text), so "
+                "responses are always small. Use this when the user describes a file in "
+                "natural language ('my FYP SRS', 'the budget spreadsheet') rather than "
+                "giving an exact file_path. Show matches to the user for confirmation, "
+                "then call search_documents with file_paths set to the chosen paths. "
+                "Ideal first step for multi-document comparison queries."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name_query":       {"type": "string",  "description": "Substring to match against file names and paths (case-insensitive)."},
+                    "file_type_filter": {"type": "string",  "description": "Restrict to a single file type, e.g. pdf, docx, xlsx."},
+                    "folder_filter":    {"type": "string",  "description": "Restrict to file_paths containing this folder substring."},
+                    "limit":            {"type": "integer", "description": "Max matches (1-50, default 50)."},
+                },
+                "required": ["name_query"],
             },
         ),
         Tool(
@@ -127,6 +148,7 @@ ENDPOINTS = {
     "search_documents": ("POST", "/tools/search_documents"),
     "get_document":     ("POST", "/tools/get_document"),
     "index_status":     ("GET",  "/tools/index_status"),
+    "list_files":       ("GET",  "/tools/list_files"),
     "save_to_onedrive": ("POST", "/tools/save_to_onedrive"),
 }
 
