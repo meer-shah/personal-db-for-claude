@@ -1,0 +1,40 @@
+[Unit]
+Description=PKP Full Indexer (long-running --full sync with auto-restart)
+After=network.target docker.service pkp-mcp.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=<USER>
+WorkingDirectory=<APP_DIR>
+EnvironmentFile=<APP_DIR>/.env
+ExecStart=<APP_DIR>/venv/bin/python -m ingestion.runner --full
+
+# Run at lower priority so the indexer doesn't starve the MCP server
+# during search queries.
+Nice=10
+
+# Auto-restart on any failure (OOM kill, segfault, unhandled exception).
+# 60s delay between restarts gives the system breathing room and avoids
+# tight crash loops if the issue is structural.
+Restart=on-failure
+RestartSec=60
+
+# Crash-loop guard: if the service fails 5 times within 30 minutes,
+# stop trying. This prevents pathological code bugs from burning CPU
+# forever. Use `systemctl reset-failed pkp-full-indexer` to clear after
+# fixing the underlying issue.
+StartLimitBurst=5
+StartLimitIntervalSec=1800
+
+# SIGTERM gives runner.py's signal handler a chance to flush in-flight
+# work to Qdrant cleanly. 5 minutes is generous — graceful shutdown
+# usually completes in seconds.
+KillSignal=SIGTERM
+TimeoutStopSec=300
+
+StandardOutput=append:/var/log/pkp/full-indexer.log
+StandardError=append:/var/log/pkp/full-indexer.log
+
+[Install]
+WantedBy=multi-user.target

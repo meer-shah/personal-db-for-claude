@@ -267,9 +267,22 @@ sudo systemctl status  pkp-mcp.service
 sudo systemctl restart pkp-mcp.service
 tail -f /var/log/pkp/mcp.log
 
-# Indexer timer (runs hourly)
+# Indexer timer (runs hourly delta sync)
 sudo systemctl status  pkp-indexer.timer
 sudo systemctl list-timers pkp-indexer.timer
+
+# Long-running full indexer (auto-restarts on crash; use for first index or full re-index)
+sudo systemctl enable --now pkp-full-indexer.service   # starts the run + on-boot
+sudo systemctl status pkp-full-indexer.service
+sudo systemctl stop   pkp-full-indexer.service          # graceful (SIGTERM, runner.py drains in-flight)
+tail -f /var/log/pkp/full-indexer.log
+# After fixing a recurring code crash, clear the start-limit gate:
+sudo systemctl reset-failed pkp-full-indexer.service
+
+# Bad-file quarantine ledger (files that crashed the parser ≥3 times)
+cat /var/pkp/bad_files.json
+# Force a single quarantined file to retry: edit the JSON to remove its entry
+# (or pass --force on a manual run, which bypasses both dedup and quarantine).
 
 # Caddy
 sudo systemctl status caddy
