@@ -81,8 +81,20 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="index_status",
-            description="Check the indexing status of the knowledge base — files indexed, percent complete, errors.",
-            inputSchema={"type": "object", "properties": {}},
+            description=(
+                "Check the indexing status of the knowledge base — files indexed, "
+                "percent complete, total chunks, and a small sample of errors. "
+                "By default returns a compact summary that always fits any response "
+                "cap. Pass include_errors=true to get a paginated full error list."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_errors": {"type": "boolean", "description": "Return a paginated slice of the full error list. Default false (returns a 5-error sample only)."},
+                    "errors_limit":   {"type": "integer", "description": "Errors per page when include_errors=true (1-200, default 50)."},
+                    "errors_offset":  {"type": "integer", "description": "Pagination offset when include_errors=true. Default 0."},
+                },
+            },
         ),
         Tool(
             name="save_to_onedrive",
@@ -121,7 +133,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             if method == "GET":
-                r = await client.get(url, headers=HEADERS)
+                # Forward arguments as query params so tools like index_status
+                # can accept include_errors=true / errors_limit / errors_offset.
+                r = await client.get(url, headers=HEADERS, params=arguments or None)
             else:
                 r = await client.post(url, headers=HEADERS, json=arguments)
         r.raise_for_status()
