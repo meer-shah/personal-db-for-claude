@@ -85,6 +85,17 @@ class IndexStatusResponse(BaseModel):
     errors_has_more:    bool = False
 
 
+def _read_priority_state() -> dict | None:
+    """Return the priority ledger or None if priority indexing isn't active."""
+    p = Path("/var/pkp/priority.json")
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
 def _build_summary(
     *,
     currently_indexing: bool,
@@ -105,6 +116,22 @@ def _build_summary(
         parts.append(f"{total_chunks:,} chunks indexed in Qdrant")
     else:
         parts.append("Qdrant is empty (no chunks indexed yet)")
+
+    # Mention priority phase if active — this is what the user is most
+    # likely asking about when they ran --set-priority.
+    priority = _read_priority_state()
+    if priority and priority.get("folders"):
+        folders     = priority["folders"]
+        files_done  = priority.get("files_done", 0)
+        restart_n   = priority.get("restart_count", 0)
+        folder_list = ", ".join(folders) if len(folders) <= 3 else f"{folders[0]} (+{len(folders)-1} more)"
+        if restart_n > 0:
+            parts.append(
+                f"priority phase running — {files_done} files indexed in {folder_list}, "
+                f"resumed after {restart_n} restart(s)"
+            )
+        else:
+            parts.append(f"priority phase running — {files_done} files indexed in {folder_list}")
 
     # Then describe what the indexer is doing.
     if currently_indexing:
