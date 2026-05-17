@@ -37,6 +37,11 @@ CANDIDATE_POOL_MAX     = 500
 HNSW_EF              = 256
 RERANK_BATCH_SIZE    = 64
 CONTEXT_NEIGHBOURS   = 1   # fetch chunk_index ±1 around each top result
+# Per-result preview cap. Search response is the *index* (short previews to
+# pick relevant hits); full text is reachable via get_document. Without this,
+# 8 hits × ~3 KB of expanded context can blow past Claude Desktop's ~1 MB MCP
+# response cap and the client sees "memory issue / response too large".
+PREVIEW_CHAR_CAP     = 800
 
 # Audit log — one line per query; falls back to project dir if /var/log/pkp not writable
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +75,10 @@ class SearchRequest(BaseModel):
     # complex / multi-doc queries. Each chunk is ~3 KB after context expansion,
     # so 100 chunks ≈ 300 KB — comfortably under the 1 MB MCP response cap.
     top_k:             int        = Field(default=5, ge=1, le=100)
+    # Opt-in: return full chunk text instead of the PREVIEW_CHAR_CAP-truncated
+    # preview. Off by default to keep responses under Claude Desktop's ~1 MB
+    # MCP cap. Set to true only when the caller knows the result set is small.
+    full_text:         bool       = False
     file_type_filter:  str | None = None   # e.g. "docx", "pdf"
     folder_filter:     str | None = None   # prefix match on file_path
     author_filter:     str | None = None   # substring match on author
@@ -304,6 +313,8 @@ def search_documents(
         fp = p.get("file_path", "")
         ci = p.get("chunk_index")
         merged_text = expanded.get((fp, ci), p.get("text", ""))
+        if not req.full_text and len(merged_text) > PREVIEW_CHAR_CAP:
+            merged_text = merged_text[:PREVIEW_CHAR_CAP] + " …[truncated — call get_document for full text]"
         results.append(SearchResult(
             text          = merged_text,
             score         = round(float(h.score), 4),

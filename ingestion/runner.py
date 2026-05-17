@@ -1386,31 +1386,63 @@ def _stream_all_files(
         t.join(timeout=5.0)
 
 
-def _download_to(tm, file_id: str, local_path: str) -> None:
+def _download_to(tm, file_id: str, local_path: str, max_attempts: int = 10) -> None:
     """
     Download a file from OneDrive. Takes a TokenManager so long ingest runs
-    survive the ~60-min access-token TTL. Retries once on 401 by forcing
-    a token refresh; other errors propagate.
+    survive the ~60-min access-token TTL.
+
+    Retry policy:
+      401 → force token refresh, retry immediately (does not consume an attempt)
+      429 / 5xx → honor Retry-After header when present, else exponential backoff
+      max_attempts (default 10) covers sustained Graph throttling windows; we
+      raise the previous cap (was 2) because Microsoft sometimes asks for 5+ min
+      and we were burning retries before the throttle window passed.
     """
+    import time
+    import requests as req_lib
     GRAPH = "https://graph.microsoft.com/v1.0"
     url   = f"{GRAPH}/me/drive/items/{file_id}/content"
     session = _get_http_session()
-    for attempt in range(2):
+    refreshed_once = False
+    for attempt in range(max_attempts):
         headers = {"Authorization": f"Bearer {tm.get()}"}
-        # stream=True so we don't materialize the full response body in RAM
-        # before writing — important for large PDFs/PPTX in a 1TB library.
-        with session.get(url, headers=headers, timeout=300, stream=True) as resp:
-            if resp.status_code == 401 and attempt == 0:
-                log.warning("Graph 401 on download %s — refreshing token", file_id)
-                tm.force_refresh()
-                continue
-            resp.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            return
-    raise RuntimeError(f"Download failed for {file_id} after token refresh")
+        try:
+            # stream=True so we don't materialize the full response body in RAM
+            # before writing — important for large PDFs/PPTX in a 1TB library.
+            with session.get(url, headers=headers, timeout=300, stream=True) as resp:
+                if resp.status_code == 401 and not refreshed_once:
+                    log.warning("Graph 401 on download %s — refreshing token", file_id)
+                    tm.force_refresh()
+                    refreshed_once = True
+                    continue
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    # Honor Retry-After if Graph tells us how long to wait —
+                    # otherwise exponential backoff capped at 5 min.
+                    ra = resp.headers.get("Retry-After")
+                    if ra and ra.isdigit():
+                        wait = min(int(ra), 300)
+                    else:
+                        wait = min(2 ** attempt, 300)
+                    log.warning(
+                        "Graph %d on download %s — retry in %ds (attempt %d/%d)",
+                        resp.status_code, file_id, wait, attempt + 1, max_attempts,
+                    )
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                with open(local_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                return
+        except req_lib.RequestException as e:
+            wait = min(2 ** attempt, 300)
+            log.warning(
+                "Download network error %s: %r — retry in %ds (attempt %d/%d)",
+                file_id, e, wait, attempt + 1, max_attempts,
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"Download failed for {file_id} after {max_attempts} attempts")
 
 
 def _print_summary(results: list[dict], total_files: int = 0) -> None:
