@@ -342,6 +342,62 @@ See [CLIENT_SETUP.md](CLIENT_SETUP.md). You give the end user:
 
 ---
 
+## Tuning for large libraries (100k+ files)
+
+For libraries with hundreds of thousands of files, two things tend to bite:
+Microsoft Graph 429 throttling, and Claude Desktop's ~1 MB MCP response cap.
+The code defaults handle both, but if you see persistent 429 errors or
+"response too large" complaints from Claude, tune as follows.
+
+### Reduce indexer concurrency
+
+The default is 6 workers downloading in parallel. On a library where Graph
+is sustained-throttling you, halve this:
+
+```bash
+sudo systemctl edit pkp-full-indexer.service
+```
+
+Paste this and save:
+
+```ini
+[Service]
+Environment="PKP_INGEST_WORKERS=3"
+# Optional: raise the crash-loop circuit breaker so brief restart bursts
+# don't halt the service. Default is 5 restarts / 30 min.
+StartLimitBurst=10
+StartLimitIntervalSec=3600
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart pkp-full-indexer.service
+```
+
+Fewer parallel downloads → proportionally fewer 429s. Trade-off is slower
+wall-clock indexing, but you lose fewer files to throttle-exhausted retries.
+
+### How throttling is handled
+
+`_download_to` honors Microsoft's `Retry-After` header on 429/5xx — if Graph
+asks for 300s, we wait exactly 300s (clamped to 5 min ceiling), falling back
+to exponential backoff if the header is missing. Max attempts is 10. You
+should see far fewer "DOWNLOAD ERROR ... 429" lines in the log after this
+patch landed.
+
+### Search response size
+
+`search_documents` truncates each result's text to ~800 chars by default so
+broad queries don't blow past Claude Desktop's MCP cap. If a caller wants
+the full chunk text back in the search response (rather than a follow-up
+`get_document` call), pass `full_text=true` in the request body. The
+default-off behavior is the right one for Claude Desktop — full text is
+always reachable via `get_document`.
+
+---
+
 ## Updating later
 
 Pull updates from `main`:
@@ -377,6 +433,8 @@ so explicitly. Otherwise, the steps above are sufficient.
 | `pkp-mcp.service` fails with `ModuleNotFoundError: No module named 'mcp'` | MCP SDK missing. Run `pip install mcp==1.9.0` then `sudo systemctl restart pkp-mcp.service`. |
 | `pkp-mcp.service` fails with any other `ModuleNotFoundError` | A dependency is missing. Re-run `pip install -r requirements.txt` inside the venv, then restart the service. |
 | Indexer crashes with `504 Server Error: Gateway Timeout` from `graph.microsoft.com` | OneDrive's Graph API timed out while listing a large folder. The current code retries automatically with exponential backoff (up to 6 attempts). If it still fails, just re-run `python -m ingestion.runner --full` — the content-hash deduplication means already-indexed files are skipped. |
+| Many "DOWNLOAD ERROR ... 429 Too Many Requests" in `full-indexer.log` | Microsoft Graph is throttling sustained download traffic. `_download_to` honors `Retry-After` on 429 and retries up to 10 times, but if you see hundreds of these, lower `PKP_INGEST_WORKERS` (see *Tuning for large libraries*). Halving workers roughly halves the 429 rate. |
+| Claude Desktop reports "response too large" or memory issues on search | The search response exceeded Claude Desktop's ~1 MB MCP cap. Lower the `top_k` you're requesting, or rely on the default 800-char preview truncation (full text is always reachable via `get_document`). |
 | `sudo: marcvista is not in the sudoers file` | The `usermod -aG sudo` was applied but the session predates it. Log out fully (`exit` from the SSH session, then reconnect via `ssh marcvista@<SERVER_IP>`) and try again. |
 
 Logs:
