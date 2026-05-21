@@ -203,16 +203,62 @@ def _point_id(onedrive_item_id: str, chunk_index: int) -> str:
 
 
 def _existing_hash(client: QdrantClient, onedrive_item_id: str) -> str | None:
-    """Return the content_hash stored for chunk_index=0 of this item, or None."""
+    """Return the content_hash stored for chunk_index=0 of this item, or None.
+
+    NOTE: only returns the hash if the file's chunks are *fully committed* —
+    i.e. all batches landed. Half-indexed files (large PDFs that crashed
+    between Qdrant batch upserts) return None so they get reprocessed.
+    See _upsert_chunks for the commit-marker write order.
+    """
     point_id = _point_id(onedrive_item_id, 0)
     results = client.retrieve(
         collection_name=COLLECTION,
         ids=[point_id],
         with_payload=True,
     )
-    if results:
-        return results[0].payload.get("content_hash")
-    return None
+    if not results:
+        return None
+    payload = results[0].payload or {}
+    # Half-indexed file detection. The `committed` flag is written by
+    # _upsert_chunks as the FINAL step (chunk 0 only). Three cases:
+    #   - committed=True   → fully indexed, safe to dedup
+    #   - committed=False  → crash between batches, must reprocess
+    #   - field missing    → legacy chunk written before commit-marker was
+    #                        introduced; treat as committed for backwards
+    #                        compatibility (otherwise the entire existing
+    #                        20M-chunk library would re-index on first run
+    #                        after the upgrade).
+    if payload.get("committed") is False:
+        return None
+    return payload.get("content_hash")
+
+
+def _existing_mtime(client: QdrantClient, onedrive_item_id: str) -> str | None:
+    """Return the stored ISO modified_date of a fully-committed item, or None.
+
+    Used as a fast pre-download dedup: if Qdrant already has chunks for this
+    item AND the Graph-reported lastModifiedDateTime matches, we can skip the
+    download entirely (saving bandwidth + the per-file RAM spike that was
+    triggering hourly OOMs even during dedup-skip cycles).
+
+    Only matches *committed* files — half-indexed files return None so they
+    get reprocessed.
+    """
+    point_id = _point_id(onedrive_item_id, 0)
+    results = client.retrieve(
+        collection_name=COLLECTION,
+        ids=[point_id],
+        with_payload=True,
+    )
+    if not results:
+        return None
+    payload = results[0].payload or {}
+    # Same backwards-compat rule as _existing_hash: missing flag = legacy
+    # chunk, treat as committed. Only an explicit False (set by the new
+    # write path) means "half-indexed, don't dedup."
+    if payload.get("committed") is False:
+        return None
+    return payload.get("modified_date")
 
 
 def _delete_item_chunks(client: QdrantClient, onedrive_item_id: str) -> None:
@@ -228,7 +274,24 @@ def _delete_item_chunks(client: QdrantClient, onedrive_item_id: str) -> None:
 
 
 def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
-    points = []
+    """
+    Upsert all chunks for one file, then write a 'committed=True' marker on
+    chunk 0 as the final step.
+
+    Crash-safety: for files with >500 chunks the upsert is split into multiple
+    Qdrant HTTP batches. If we crashed between batches without this scheme,
+    chunk 0 would already be tagged with the correct content_hash and the
+    next-run dedup check would skip the file — leaving the tail chunks
+    permanently missing.
+
+    By writing all chunks with committed=False first, and only flipping
+    chunk 0 to committed=True after every other batch lands, _existing_hash
+    can detect half-indexed files and trigger a reprocess.
+    """
+    if not chunks:
+        return
+
+    points_by_index: dict[int, PointStruct] = {}
     for c in chunks:
         payload = {
             "text":               c.text,
@@ -244,17 +307,33 @@ def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
             "slide_number":       c.slide_number,
             "sheet_name":         c.sheet_name,
             "modified_date":      c.modified_date.isoformat(),
-            "modified_date_ts":   c.modified_date.timestamp(),   # float for Range filter
+            "modified_date_ts":   c.modified_date.timestamp(),
             "created_date":       c.created_date.isoformat(),
+            # Commit marker — flipped to True on chunk 0 only after all
+            # other chunks are written. Half-indexed files have this False
+            # (or missing) on chunk 0 and are correctly reprocessed.
+            "committed":          False,
         }
-        points.append(PointStruct(
+        points_by_index[c.chunk_index] = PointStruct(
             id=_point_id(c.onedrive_item_id, c.chunk_index),
             vector=c.vector,
             payload=payload,
-        ))
-    # Batch upsert in groups of 500
-    for i in range(0, len(points), 500):
-        client.upsert(collection_name=COLLECTION, points=points[i:i + 500])
+        )
+
+    # Write chunk 0 LAST with committed=True; write everything else first.
+    chunk0 = points_by_index.pop(0, None)
+    rest = list(points_by_index.values())
+
+    # Batch upsert the tail (non-chunk-0) in groups of 500.
+    for i in range(0, len(rest), 500):
+        client.upsert(collection_name=COLLECTION, points=rest[i:i + 500])
+
+    # Finally write chunk 0 with the commit marker. If we crash before this
+    # call, the next run sees committed=False (or no chunk 0 at all) and
+    # reprocesses the file. If chunk 0 was the only chunk, just write it now.
+    if chunk0 is not None:
+        chunk0.payload["committed"] = True
+        client.upsert(collection_name=COLLECTION, points=[chunk0])
 
 # ── Bad-file quarantine ───────────────────────────────────────────────────────
 
@@ -606,8 +685,17 @@ def process_file(
     """
     file_type = Path(local_path).suffix.lstrip(".").lower()
 
+    # Stream-hash in 1 MiB blocks instead of f.read() — for a 1TB library
+    # with many large PDFs/PPTX, slurping the whole file into Python's heap
+    # before hashing caused per-file RAM spikes proportional to file size,
+    # which compounded into the hourly OOM cycles the client was hitting
+    # even during dedup-skip phases (because every file is hashed, even
+    # ones that end up skipped).
+    h = hashlib.sha256()
     with open(local_path, "rb") as f:
-        file_hash = hashlib.sha256(f.read()).hexdigest()
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    file_hash = h.hexdigest()
 
     if not force:
         stored_hash = _existing_hash(client, onedrive_item_id)
@@ -835,6 +923,19 @@ def run_full(force: bool = False) -> None:
             ext        = Path(file_name).suffix.lower()
             if ext not in SUPPORTED_EXTS:
                 return {"file": file_name, "status": "skipped", "chunks": 0, "error": None}
+
+            # Fast pre-download dedup: if Qdrant already has a fully-committed
+            # copy of this item at the same modified_date, skip the download
+            # entirely. This eliminates the per-file RAM spike and Graph
+            # download cost on restart-resume runs (where most files are
+            # already indexed). Falls through to the slower hash-based check
+            # in process_file() if mtime differs or chunk 0 isn't committed.
+            if not force:
+                item_mtime = item.get("lastModifiedDateTime")
+                if item_mtime:
+                    stored_mtime = _existing_mtime(client, file_id)
+                    if stored_mtime and stored_mtime == item_mtime:
+                        return {"file": file_name, "status": "skipped", "chunks": 0, "error": None}
 
             local_path = str(WORK_DIR / f"{file_id}_{file_name}")
             _download_to(tm, file_id, local_path)
