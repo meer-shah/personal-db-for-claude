@@ -137,6 +137,40 @@ def _same_instant(a, b) -> bool:
     db = _parse_graph_dt(b)
     return da is not None and db is not None and da == db
 
+
+def _current_rss_mb() -> int:
+    """Current process resident memory in MB (Linux /proc). 0 if unavailable."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _rss_ceiling_mb() -> int:
+    """RSS ceiling for the graceful self-recycle.
+
+    Override with PKP_RSS_CEILING_MB; otherwise defaults to 70% of total RAM
+    so the indexer recycles itself (graceful drain + exit 75 -> systemd
+    restart) before the kernel OOM-kills it. Returns 0 (disabled) only if it
+    cannot determine total RAM and no override is set.
+    """
+    env = os.getenv("PKP_RSS_CEILING_MB")
+    if env and env.strip().isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_mb = int(line.split()[1]) // 1024
+                    return int(total_mb * 0.70)
+    except Exception:
+        pass
+    return 0
+
 # ── Exclusion list ────────────────────────────────────────────────────────────
 
 def _load_exclusions() -> list[str]:
@@ -941,6 +975,8 @@ def run_full(force: bool = False) -> None:
 
     workers = int(os.getenv("PKP_INGEST_WORKERS", "12"))
     MAX_IN_FLIGHT = workers * 4
+    rss_ceiling_mb = _rss_ceiling_mb()
+    recycle_event = threading.Event()
 
     def _process_item(item: dict, *, track_progress: bool) -> dict:
         """
@@ -1066,6 +1102,18 @@ def run_full(force: bool = False) -> None:
                         phase_label, seen_count, len(futures), skipped_count,
                     )
 
+                if rss_ceiling_mb and seen_count % 256 == 0:
+                    rss = _current_rss_mb()
+                    if rss >= rss_ceiling_mb:
+                        log.warning(
+                            "RSS %d MB >= ceiling %d MB - draining in-flight work and "
+                            "recycling the process (systemd restarts; dedup resumes cheaply).",
+                            rss, rss_ceiling_mb,
+                        )
+                        recycle_event.set()
+                        stop_event.set()
+                        break
+
             if not stop_event.is_set():
                 log.info(
                     "%s enumeration complete: %d seen, %d submitted, %d excluded",
@@ -1140,6 +1188,13 @@ def run_full(force: bool = False) -> None:
         signal.signal(signal.SIGTERM, prev_sigterm)
 
     _print_summary(all_results, total_files=total_submitted)
+
+    if recycle_event.is_set():
+        log.warning(
+            "Memory-ceiling recycle: exiting (code 75) so systemd restarts a fresh "
+            "process. Already-indexed files skip instantly on resume."
+        )
+        sys.exit(75)
 
 # ── OneDrive delta mode ───────────────────────────────────────────────────────
 

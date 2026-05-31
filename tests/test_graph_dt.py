@@ -30,3 +30,15 @@ def test_none_and_garbage():
 
 def test_different_instants_not_equal():
     assert not _same_instant("2023-11-26T09:01:20Z", "2023-11-26T09:01:21Z")
+
+
+def test_rss_ceiling_env_override(monkeypatch):
+    monkeypatch.setenv("PKP_RSS_CEILING_MB", "12345")
+    from ingestion.runner import _rss_ceiling_mb
+    assert _rss_ceiling_mb() == 12345
+
+
+def test_rss_ceiling_default_positive(monkeypatch):
+    monkeypatch.delenv("PKP_RSS_CEILING_MB", raising=False)
+    from ingestion.runner import _rss_ceiling_mb
+    assert _rss_ceiling_mb() > 0

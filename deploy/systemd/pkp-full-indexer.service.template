@@ -27,14 +27,15 @@ Nice=10
 # 60s delay between restarts gives the system breathing room and avoids
 # tight crash loops if the issue is structural.
 Restart=on-failure
+RestartForceExitStatus=75
 RestartSec=60
 
 # Crash-loop guard: if the service fails 5 times within 30 minutes,
 # stop trying. This prevents pathological code bugs from burning CPU
 # forever. Use `systemctl reset-failed pkp-full-indexer` to clear after
 # fixing the underlying issue.
-StartLimitBurst=5
-StartLimitIntervalSec=1800
+StartLimitBurst=50
+StartLimitIntervalSec=3600
 
 # SIGTERM gives runner.py's signal handler a chance to flush in-flight
 # work to Qdrant cleanly. 5 minutes is generous — graceful shutdown
