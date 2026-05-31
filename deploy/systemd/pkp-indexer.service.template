@@ -8,6 +8,15 @@ Type=simple
 User=<USER>
 WorkingDirectory=<APP_DIR>
 EnvironmentFile=<APP_DIR>/.env
+# Cap native-lib threads + glibc arenas so the multi-threaded indexer
+# does not oversubscribe CPU or let per-thread allocator arenas grow RSS
+# until the worker OOM-restarts. Each ingest worker thread runs torch
+# single-threaded; parallelism comes from the worker pool, not BLAS.
+Environment="OMP_NUM_THREADS=1"
+Environment="MKL_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+Environment="MALLOC_ARENA_MAX=2"
+Environment="TOKENIZERS_PARALLELISM=false"
 ExecStart=<APP_DIR>/venv/bin/python -m ingestion.runner --delta
 Nice=10
 Restart=on-failure

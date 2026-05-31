@@ -8,6 +8,15 @@ Type=simple
 User=<USER>
 WorkingDirectory=<APP_DIR>
 EnvironmentFile=<APP_DIR>/.env
+# Cap native-lib threads + glibc arenas so the multi-threaded indexer
+# does not oversubscribe CPU or let per-thread allocator arenas grow RSS
+# until the worker OOM-restarts. Each ingest worker thread runs torch
+# single-threaded; parallelism comes from the worker pool, not BLAS.
+Environment="OMP_NUM_THREADS=1"
+Environment="MKL_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+Environment="MALLOC_ARENA_MAX=2"
+Environment="TOKENIZERS_PARALLELISM=false"
 ExecStart=<APP_DIR>/venv/bin/python -m ingestion.runner --full
 
 # Run at lower priority so the indexer doesn't starve the MCP server
@@ -18,14 +27,15 @@ Nice=10
 # 60s delay between restarts gives the system breathing room and avoids
 # tight crash loops if the issue is structural.
 Restart=on-failure
+RestartForceExitStatus=75
 RestartSec=60
 
 # Crash-loop guard: if the service fails 5 times within 30 minutes,
 # stop trying. This prevents pathological code bugs from burning CPU
 # forever. Use `systemctl reset-failed pkp-full-indexer` to clear after
 # fixing the underlying issue.
-StartLimitBurst=5
-StartLimitIntervalSec=1800
+StartLimitBurst=50
+StartLimitIntervalSec=3600
 
 # SIGTERM gives runner.py's signal handler a chance to flush in-flight
 # work to Qdrant cleanly. 5 minutes is generous — graceful shutdown
