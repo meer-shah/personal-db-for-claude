@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +44,11 @@ from qdrant_client.models import (
 from chunker import chunk_texts
 from embedder import embed_chunks
 from models.chunk import Chunk
+from parsers.docx_parser import parse_docx
+from parsers.pdf_parser import parse_pdf
+from parsers.xlsx_parser import parse_xlsx
+from parsers.pptx_parser import parse_pptx
+from parsers.plain_parser import parse_plain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -93,6 +99,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("runner")
 
+
+def _parse_graph_dt(value):
+    """Parse a Microsoft Graph datetime string into an aware UTC datetime.
+
+    Graph returns timestamps like '2023-11-26T09:01:20Z' and sometimes with
+    7-digit fractional seconds ('...20.1234567Z'), which datetime.fromisoformat
+    rejects. We normalize trailing 'Z' to '+00:00' and truncate over-long
+    fractional seconds to the 6 digits Python accepts. Returns None if the
+    value is missing or unparseable.
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(.*\.\d{6})\d+([+-]\d{2}:\d{2})$", s)
+    if m:
+        s = m.group(1) + m.group(2)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _same_instant(a, b) -> bool:
+    """True if two Graph/ISO datetime strings refer to the same instant.
+
+    Robust to format differences (e.g. 'Z' vs '+00:00') that previously made
+    the pre-download mtime dedup never match, forcing a full re-download of
+    already-indexed files on every (re)start.
+    """
+    da = _parse_graph_dt(a)
+    db = _parse_graph_dt(b)
+    return da is not None and db is not None and da == db
+
 # ── Exclusion list ────────────────────────────────────────────────────────────
 
 def _load_exclusions() -> list[str]:
@@ -119,19 +163,14 @@ def _is_excluded(path: str, patterns: list[str]) -> bool:
 def _parse_file(file_path: str) -> list[dict]:
     ext = Path(file_path).suffix.lower()
     if ext == ".docx":
-        from parsers.docx_parser import parse_docx
         return parse_docx(file_path)
     elif ext == ".pdf":
-        from parsers.pdf_parser import parse_pdf
         return parse_pdf(file_path)
     elif ext == ".xlsx":
-        from parsers.xlsx_parser import parse_xlsx
         return parse_xlsx(file_path)
     elif ext == ".pptx":
-        from parsers.pptx_parser import parse_pptx
         return parse_pptx(file_path)
     elif ext in {".txt", ".md", ".csv"}:
-        from parsers.plain_parser import parse_plain
         return parse_plain(file_path)
     else:
         return []
@@ -934,18 +973,14 @@ def run_full(force: bool = False) -> None:
                 item_mtime = item.get("lastModifiedDateTime")
                 if item_mtime:
                     stored_mtime = _existing_mtime(client, file_id)
-                    if stored_mtime and stored_mtime == item_mtime:
+                    if stored_mtime and _same_instant(stored_mtime, item_mtime):
                         return {"file": file_name, "status": "skipped", "chunks": 0, "error": None}
 
             local_path = str(WORK_DIR / f"{file_id}_{file_name}")
             _download_to(tm, file_id, local_path)
 
-            modified = datetime.fromisoformat(
-                item.get("lastModifiedDateTime", datetime.now(tz=timezone.utc).isoformat())
-            )
-            created = datetime.fromisoformat(
-                item.get("createdDateTime", modified.isoformat())
-            )
+            modified = _parse_graph_dt(item.get("lastModifiedDateTime")) or datetime.now(tz=timezone.utc)
+            created = _parse_graph_dt(item.get("createdDateTime")) or modified
             author = (item.get("createdBy") or {}).get("user", {}).get("displayName")
 
             return process_file(
@@ -1179,8 +1214,8 @@ def run_delta() -> None:
             local_path = str(WORK_DIR / f"{file_id}_{file_name}")
             _download_to(tm, file_id, local_path)
 
-            modified = datetime.fromisoformat(item.get("lastModifiedDateTime", datetime.now(tz=timezone.utc).isoformat()))
-            created  = datetime.fromisoformat(item.get("createdDateTime", modified.isoformat()))
+            modified = _parse_graph_dt(item.get("lastModifiedDateTime")) or datetime.now(tz=timezone.utc)
+            created  = _parse_graph_dt(item.get("createdDateTime")) or modified
             author   = (item.get("createdBy") or {}).get("user", {}).get("displayName")
 
             result = process_file(
