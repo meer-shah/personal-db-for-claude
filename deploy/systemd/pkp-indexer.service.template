@@ -8,6 +8,7 @@ Type=simple
 User=<USER>
 WorkingDirectory=<APP_DIR>
 EnvironmentFile=<APP_DIR>/.env
+Environment="PYTHONUNBUFFERED=1"
 # Cap native-lib threads + glibc arenas so the multi-threaded indexer
 # does not oversubscribe CPU or let per-thread allocator arenas grow RSS
 # until the worker OOM-restarts. Each ingest worker thread runs torch
