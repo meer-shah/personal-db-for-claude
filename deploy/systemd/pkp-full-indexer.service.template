@@ -17,6 +17,12 @@ Environment="MKL_NUM_THREADS=1"
 Environment="OPENBLAS_NUM_THREADS=1"
 Environment="MALLOC_ARENA_MAX=2"
 Environment="TOKENIZERS_PARALLELISM=false"
+# Hard cgroup backstop: if the graceful self-recycle (70% RAM) is ever
+# outrun by a sudden spike, the kernel kills THIS service's cgroup at 90%
+# instead of OOM-killing the whole box (protects Qdrant + MCP). Restarts
+# via Restart=on-failure; dedup makes resume cheap.
+MemoryAccounting=yes
+MemoryMax=90%
 ExecStart=<APP_DIR>/venv/bin/python -m ingestion.runner --full
 
 # Run at lower priority so the indexer doesn't starve the MCP server
