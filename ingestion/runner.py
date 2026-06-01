@@ -978,6 +978,26 @@ def run_full(force: bool = False) -> None:
     rss_ceiling_mb = _rss_ceiling_mb()
     recycle_event = threading.Event()
 
+    # Background memory monitor: samples RSS every 5s, INDEPENDENT of the
+    # enumeration cadence, so an RSS spike during a large-file parse or the
+    # drain phase still triggers a graceful recycle (an enumeration-coupled
+    # check would miss it). On crossing the ceiling it sets recycle_event +
+    # stop_event; the main loop then drains in-flight work and exits 75.
+    def _rss_monitor():
+        while not stop_event.wait(5):
+            if rss_ceiling_mb:
+                rss = _current_rss_mb()
+                if rss >= rss_ceiling_mb:
+                    log.warning(
+                        "RSS %d MB >= ceiling %d MB - requesting graceful recycle "
+                        "(background monitor).",
+                        rss, rss_ceiling_mb,
+                    )
+                    recycle_event.set()
+                    stop_event.set()
+                    return
+    threading.Thread(target=_rss_monitor, name="rss-monitor", daemon=True).start()
+
     def _process_item(item: dict, *, track_progress: bool) -> dict:
         """
         Download → parse → chunk → embed → upsert one item.
@@ -1102,17 +1122,6 @@ def run_full(force: bool = False) -> None:
                         phase_label, seen_count, len(futures), skipped_count,
                     )
 
-                if rss_ceiling_mb and seen_count % 256 == 0:
-                    rss = _current_rss_mb()
-                    if rss >= rss_ceiling_mb:
-                        log.warning(
-                            "RSS %d MB >= ceiling %d MB - draining in-flight work and "
-                            "recycling the process (systemd restarts; dedup resumes cheaply).",
-                            rss, rss_ceiling_mb,
-                        )
-                        recycle_event.set()
-                        stop_event.set()
-                        break
 
             if not stop_event.is_set():
                 log.info(
