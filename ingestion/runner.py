@@ -758,6 +758,16 @@ def process_file(
     """
     file_type = Path(local_path).suffix.lstrip(".").lower()
 
+    # Diagnostic: log the file, its on-disk size, and current RSS right before
+    # any heavy work. The LAST "PROCESS" line before an OOM/recycle names the
+    # file (and size) that spiked memory -- the data needed to pinpoint which
+    # file/parser blows up RSS at scale. RSS lets you watch the jump per file.
+    try:
+        _size_mb = Path(local_path).stat().st_size / (1024 * 1024)
+    except OSError:
+        _size_mb = -1.0
+    log.info("PROCESS %s (%.1f MB, rss=%d MB)", file_name, _size_mb, _current_rss_mb())
+
     # Stream-hash in 1 MiB blocks instead of f.read() — for a 1TB library
     # with many large PDFs/PPTX, slurping the whole file into Python's heap
     # before hashing caused per-file RAM spikes proportional to file size,
