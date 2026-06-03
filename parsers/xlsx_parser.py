@@ -1,33 +1,59 @@
+import gc
+
 import tiktoken
 import openpyxl
+import openpyxl.reader.excel as _xl_reader
 
 _enc = tiktoken.get_encoding("cl100k_base")
 _MAX_TOKENS = 400  # leave headroom for the model's 256 word-piece limit
 
 
+# --- Work around an openpyxl 3.1.x crash on chartsheets ------------------------
+# ExcelReader.read_chartsheet() does `rels.find(...)`, but `rels` is a plain list
+# when the chartsheet has no _rels file -> AttributeError that aborts the ENTIRE
+# load_workbook(). A single chartsheet would otherwise make a whole workbook
+# unparseable and push it through the 3x-retry quarantine path (re-allocating the
+# workbook each attempt -- a real contributor to the RSS spikes observed in prod).
+# Wrap it so a problematic chartsheet is skipped while the data sheets still load.
+_orig_read_chartsheet = _xl_reader.ExcelReader.read_chartsheet
+
+
+def _safe_read_chartsheet(self, sheet, rel):
+    try:
+        return _orig_read_chartsheet(self, sheet, rel)
+    except Exception:
+        return  # skip the unreadable chartsheet; keep loading the workbook
+
+
+_xl_reader.ExcelReader.read_chartsheet = _safe_read_chartsheet
+# ------------------------------------------------------------------------------
+
+
 def parse_xlsx(file_path: str) -> list[dict]:
     """
-    Parse an Excel workbook, iterating all sheets.
-    Row 1 of each sheet is treated as column headers.
-    Rows are batched into chunks that stay under _MAX_TOKENS so large sheets
-    don't get silently truncated by the embedding model.
+    Parse an Excel workbook, iterating all data sheets. Row 1 of each sheet is
+    treated as column headers. Rows are batched into chunks that stay under
+    _MAX_TOKENS so large sheets are not truncated by the embedding model.
 
-    Returns a list of dicts with keys:
-        type        — always 'table'
-        text        — structured key:value content
-        sheet_name  — name of the source sheet
+    read_only=True keeps it streaming (no full workbook tree in memory).
+    Chart-only / non-data sheets are skipped. Memory is released via
+    wb.close() + gc.collect() on EVERY exit path (including the error path), so a
+    run of heavy or broken workbooks does not accumulate RSS until the indexer
+    OOM-kills.
+
+    Returns a list of dicts: {type: 'table', text: ..., sheet_name: ...}
     """
-    # read_only=True switches openpyxl to a streaming SAX reader: it does NOT
-    # materialize the full workbook tree, skips pivot caches entirely, and
-    # releases each row as it's yielded. This is the dominant fix for the
-    # ~5 GiB/run leak memray traced to openpyxl.get_rel + pivot_caches.
-    # data_only=True returns cached cell values rather than formula strings.
-    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    wb = None
     chunks: list[dict] = []
-
     try:
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
+            # Skip chart-only / non-data sheets: a Chartsheet has no iter_rows().
+            if not hasattr(ws, "iter_rows"):
+                continue
+
             row_iter = ws.iter_rows(values_only=True)
 
             try:
@@ -45,11 +71,11 @@ def parse_xlsx(file_path: str) -> list[dict]:
             batch_lines: list[str] = []
             batch_tokens = len(_enc.encode(context_prefix + header_line))
 
-            def _flush(lines: list[str]) -> None:
+            def _flush(lines, _sheet=sheet_name, _prefix=context_prefix, _hdr=header_line):
                 if not lines:
                     return
-                text = context_prefix + header_line + "\n" + "\n".join(lines)
-                chunks.append({"type": "table", "text": text, "sheet_name": sheet_name})
+                text = _prefix + _hdr + "\n" + "\n".join(lines)
+                chunks.append({"type": "table", "text": text, "sheet_name": _sheet})
 
             for row in row_iter:
                 if all(v is None for v in row):
@@ -73,8 +99,11 @@ def parse_xlsx(file_path: str) -> list[dict]:
 
             _flush(batch_lines)
     finally:
-        # read_only mode opens a streaming file handle that doesn't auto-close;
-        # explicit close releases it immediately rather than waiting on GC.
-        wb.close()
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+        gc.collect()
 
     return chunks
