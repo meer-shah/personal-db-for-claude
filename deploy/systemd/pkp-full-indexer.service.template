@@ -23,7 +23,8 @@ Environment="TOKENIZERS_PARALLELISM=false"
 # instead of OOM-killing the whole box (protects Qdrant + MCP). Restarts
 # via Restart=on-failure; dedup makes resume cheap.
 MemoryAccounting=yes
-MemoryMax=90%
+MemoryHigh=70%
+MemoryMax=85%
 ExecStart=<APP_DIR>/venv/bin/python -m ingestion.runner --full
 
 # Run at lower priority so the indexer doesn't starve the MCP server

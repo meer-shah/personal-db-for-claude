@@ -166,7 +166,7 @@ def _rss_ceiling_mb() -> int:
             for line in f:
                 if line.startswith("MemTotal:"):
                     total_mb = int(line.split()[1]) // 1024
-                    return int(total_mb * 0.70)
+                    return int(total_mb * 0.60)
     except Exception:
         pass
     return 0
@@ -467,7 +467,7 @@ def _is_quarantined(onedrive_item_id: str, content_hash: str | None = None) -> t
     return (True, entry)
 
 
-def _record_failure(onedrive_item_id: str, file_name: str, content_hash: str | None, error: str) -> int:
+def _record_failure(onedrive_item_id: str, file_name: str, content_hash: str | None, error: str, immediate: bool = False) -> int:
     """Increment failure count for this file. Returns the new count."""
     # Load lazily WITHOUT the lock — _load_quarantine acquires it internally.
     # Calling it inside `with _quarantine_lock` would deadlock since
@@ -490,7 +490,7 @@ def _record_failure(onedrive_item_id: str, file_name: str, content_hash: str | N
         entry.update({
             "file_name":    file_name,
             "content_hash": content_hash,
-            "fail_count":   entry.get("fail_count", 0) + 1,
+            "fail_count":   QUARANTINE_THRESHOLD if immediate else entry.get("fail_count", 0) + 1,
             "first_seen":   entry.get("first_seen", now),
             "last_attempt": now,
             "last_error":   error[:500],   # cap to avoid unbounded growth
@@ -803,7 +803,7 @@ def process_file(
     try:
         raw_chunks = _parse_file(local_path)
     except Exception as e:
-        n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}")
+        n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}", immediate=True)
         log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
         return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
@@ -818,7 +818,7 @@ def process_file(
         chunked  = chunk_texts(raw_chunks)
         embedded = embed_chunks(chunked)
     except Exception as e:
-        n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}")
+        n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}", immediate=True)
         log.error("CHUNK/EMBED ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
         return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
