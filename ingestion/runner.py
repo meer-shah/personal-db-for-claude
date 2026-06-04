@@ -766,7 +766,7 @@ def process_file(
         _size_mb = Path(local_path).stat().st_size / (1024 * 1024)
     except OSError:
         _size_mb = -1.0
-    log.info("PROCESS %s (%.1f MB, rss=%d MB)", file_name, _size_mb, _current_rss_mb())
+    log.info("PROCESS %s (%.2f MB, rss=%d MB)", file_name, _size_mb, _current_rss_mb())
 
     # Stream-hash in 1 MiB blocks instead of f.read() — for a 1TB library
     # with many large PDFs/PPTX, slurping the whole file into Python's heap
@@ -811,7 +811,11 @@ def process_file(
         # Empty isn't a "bad file" — clear any stale failures (file may have
         # been re-saved as legitimately empty).
         _clear_failure(onedrive_item_id)
-        log.info("EMPTY %s (no content extracted)", file_name)
+        try:
+            _eb = Path(local_path).stat().st_size
+        except OSError:
+            _eb = -1
+        log.info("EMPTY %s (type=%s, %d bytes - no text extracted)", file_name, file_type, _eb)
         return {"file": file_name, "status": "empty", "chunks": 0, "error": None}
 
     try:
