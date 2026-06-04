@@ -11,21 +11,19 @@ def _cell_text(tc_element) -> str:
 
 
 def _para_text(p_element) -> str:
-    """Extract text from a <w:p> element."""
+    """Extract text from a <w:p> element (includes text inside text boxes/drawings)."""
     return "".join(t.text or "" for t in p_element.findall(".//" + qn("w:t"))).strip()
 
 
 def parse_docx(file_path: str) -> list[dict]:
     """
     Parse a .docx file, walking the document body in element order so that
-    tables are detected mid-document (via <w:tbl> tags) rather than lost
-    between paragraphs. Tables are emitted as their own chunk; the last
-    paragraph before each table is prepended as context so the table chunk
-    is self-contained and searchable by topic.
+    tables are detected mid-document. Tables become their own chunk with the
+    preceding paragraph as context. Header/footer text (a separate document
+    part, not in the body) is also captured so documents whose content lives in
+    a header or footer are not indexed as empty.
 
-    Returns a list of dicts with keys:
-        type  — 'text' or 'table'
-        text  — raw string content
+    Returns a list of dicts with keys: type ('text'|'table'), text.
     """
     doc = Document(file_path)
     chunks: list[dict] = []
@@ -40,7 +38,6 @@ def parse_docx(file_path: str) -> list[dict]:
                 text_buffer.append(para)
 
         elif tag == "tbl":
-            # Flush accumulated text before the table
             if text_buffer:
                 chunks.append({"type": "text", "text": "\n".join(text_buffer)})
 
@@ -49,24 +46,16 @@ def parse_docx(file_path: str) -> list[dict]:
                 text_buffer = []
                 continue
 
-            raw_headers = [
-                _cell_text(c)
-                for c in rows[0].findall(".//" + qn("w:tc"))
-            ]
-            # Fill empty header cells with placeholders so every column is named
+            raw_headers = [_cell_text(c) for c in rows[0].findall(".//" + qn("w:tc"))]
             headers = [h if h else f"Col{i+1}" for i, h in enumerate(raw_headers)]
             table_lines = ["TABLE: " + " | ".join(headers)]
 
             for row in rows[1:]:
-                cells = [
-                    _cell_text(c)
-                    for c in row.findall(".//" + qn("w:tc"))
-                ]
+                cells = [_cell_text(c) for c in row.findall(".//" + qn("w:tc"))]
                 for h, v in zip(headers, cells):
                     table_lines.append(f"{h}: {v}")
                 table_lines.append("---")
 
-            # Prepend the last paragraph as context so the table is self-contained
             context = text_buffer[-1] if text_buffer else ""
             table_text = "\n".join(table_lines)
             if context:
@@ -75,8 +64,27 @@ def parse_docx(file_path: str) -> list[dict]:
             chunks.append({"type": "table", "text": table_text})
             text_buffer = []
 
-    # Flush any remaining text after the last element
     if text_buffer:
         chunks.append({"type": "text", "text": "\n".join(text_buffer)})
+
+    # Headers/footers live in separate document parts (not doc.element.body), so
+    # the body walk above misses them entirely. Capture unique header/footer text
+    # so docs whose only/extra content is a letterhead, legal boilerplate,
+    # classification marking, or one-line memo are not indexed as empty.
+    hf_parts: list[str] = []
+    seen_hf: set[str] = set()
+    try:
+        for section in doc.sections:
+            for label, hf in (("Header", section.header), ("Footer", section.footer)):
+                txt = "\n".join(
+                    p.text.strip() for p in hf.paragraphs if p.text and p.text.strip()
+                )
+                if txt and txt not in seen_hf:
+                    seen_hf.add(txt)
+                    hf_parts.append(f"[{label}] {txt}")
+    except Exception:
+        pass
+    if hf_parts:
+        chunks.append({"type": "text", "text": "\n".join(hf_parts)})
 
     return chunks
