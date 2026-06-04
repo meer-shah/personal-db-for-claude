@@ -30,3 +30,18 @@ def test_parse_error_quarantines_immediately(tmp_path, monkeypatch):
     skip, _ = runner._is_quarantined("item1", "h1")
     assert skip is True
     runner._quarantine_cache = None
+
+
+def test_blank_first_row_is_recovered(tmp_path):
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws["A2"] = "Name"; ws["B2"] = "Qty"; ws["A3"] = "Bolt"; ws["B3"] = 10  # row 1 blank
+    f = tmp_path / "b.xlsx"; wb.save(str(f))
+    assert len(parse_xlsx(str(f))) >= 1
+
+
+def test_title_row_then_header_is_recovered(tmp_path):
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws["A1"] = "Bill of Materials"            # single-cell title row
+    ws["A3"] = "Part"; ws["B3"] = "Cost"; ws["A4"] = "Widget"; ws["B4"] = 99
+    f = tmp_path / "t.xlsx"; wb.save(str(f))
+    assert len(parse_xlsx(str(f))) >= 1
