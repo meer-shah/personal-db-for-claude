@@ -80,6 +80,12 @@ QUARANTINE_THRESHOLD = 3
 # through to a normal full sweep of the rest of the library.
 PRIORITY_FILE              = Path("/var/pkp/priority.json")
 MAX_PRIORITY_FOLDERS       = 10
+# If Phase 1 (priority) is interrupted by a memory recycle this many times
+# in a row WITHOUT indexing a single new file, abandon the priority-first
+# ordering and clear priority so the next run does a normal full-library walk.
+# Prevents the indexer from looping forever on Phase 1 and never reaching
+# Phase 2 when the priority walk can't complete within the RSS budget.
+PHASE1_MAX_INTERRUPTS      = 3
 # After IN_PROGRESS_CRASH_THRESHOLD restarts during which a specific file was
 # in-progress without making progress on the run as a whole, that file is
 # added to the regular bad-files quarantine ledger and skipped permanently.
@@ -560,6 +566,25 @@ def _clear_priority_file() -> None:
                 PRIORITY_FILE.unlink()
         except Exception as e:
             log.warning("Could not delete priority file: %s", e)
+
+
+def _record_phase1_interrupt(made_progress: bool) -> int:
+    """Track Phase-1-interrupted-by-recycle events.
+
+    Resets to 0 when the attempt indexed at least one new file (real progress),
+    otherwise increments. Returns the current count. Used to detect a Phase 1
+    that keeps recycling without making progress so we can abandon the
+    priority-first ordering instead of looping forever.
+    """
+    if _priority_cache is None:
+        _load_priority()
+    with _priority_lock:
+        if not _priority_cache:
+            return 0
+        n = 0 if made_progress else _priority_cache.get("phase1_interrupted", 0) + 1
+        _priority_cache["phase1_interrupted"] = n
+        _save_priority()
+        return n
 
 
 def _normalize_priority_folders(folders: list[str]) -> list[str]:
@@ -1188,6 +1213,25 @@ def run_full(force: bool = False) -> None:
                     )
                     _clear_priority_file()
                     has_priority = False  # phase 2 should not exclude anymore
+                elif recycle_event.is_set():
+                    # Phase 1 was cut short by a memory recycle before completing.
+                    # If this keeps happening with no new files indexed, the
+                    # priority walk can't finish within the RSS budget and we'd
+                    # loop on Phase 1 forever, never reaching Phase 2. Track it,
+                    # and after PHASE1_MAX_INTERRUPTS give up the priority-first
+                    # ordering: clear priority so the next run does a normal full
+                    # walk (which makes incremental forward progress).
+                    made_progress = any(r.get("status") == "ok" for r in p1_results)
+                    n = _record_phase1_interrupt(made_progress)
+                    if not made_progress and n >= PHASE1_MAX_INTERRUPTS:
+                        log.error(
+                            "Phase 1 interrupted by recycle %d times without indexing "
+                            "any new file — abandoning priority-first ordering and "
+                            "clearing priority; next run does a full-library walk.", n,
+                        )
+                        _clear_priority_file()
+                        priority_folders = []
+                        has_priority = False
 
         # ── Phase 2: rest of the library (with priority folders excluded
         # if we just finished phase 1; or full library if no priority) ────
