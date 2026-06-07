@@ -60,6 +60,7 @@ VECTOR_SIZE      = 384
 SUPPORTED_EXTS   = {".docx", ".pdf", ".xlsx", ".pptx", ".txt", ".md", ".csv"}
 WORK_DIR         = Path("/var/pkp/work")
 DELTA_TOKEN_FILE = Path("/var/pkp/delta_token.json")
+FULL_CURSOR_FILE = Path("/var/pkp/full_cursor.json")
 EXCLUSIONS_FILE  = REPO_ROOT / "config" / "exclusions.txt"
 
 # Bad-file quarantine: persistent ledger of files that have repeatedly failed
@@ -585,6 +586,64 @@ def _record_phase1_interrupt(made_progress: bool) -> int:
         _priority_cache["phase1_interrupted"] = n
         _save_priority()
         return n
+
+
+# ── Resumable full-index cursor ────────────────────────────────────────────────
+# The Graph delta @odata.nextLink of the page we are about to process. Persisted
+# only AFTER a page's files are fully processed, so a recycle/crash resumes at
+# that page instead of re-walking the library from the root. Re-processing a page
+# is idempotent (content-hash dedup + the commit marker handle done/half-done
+# files). On reaching @odata.deltaLink the cursor is cleared and the delta token
+# is saved for future incremental (--delta) runs.
+
+def _load_full_cursor():
+    try:
+        if FULL_CURSOR_FILE.exists():
+            return json.loads(FULL_CURSOR_FILE.read_text()).get("url")
+    except Exception as e:
+        log.warning("Could not read full cursor (%s) — starting fresh", e)
+    return None
+
+
+def _save_full_cursor(url: str) -> None:
+    try:
+        FULL_CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FULL_CURSOR_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"url": url}))
+        tmp.replace(FULL_CURSOR_FILE)
+    except Exception as e:
+        log.warning("Could not persist full cursor: %s", e)
+
+
+def _clear_full_cursor() -> None:
+    try:
+        if FULL_CURSOR_FILE.exists():
+            FULL_CURSOR_FILE.unlink()
+    except Exception as e:
+        log.warning("Could not delete full cursor: %s", e)
+
+
+def _extract_delta_token(delta_link: str):
+    # Robustly pull the delta token from an @odata.deltaLink. Graph returns it as
+    # ".../delta?token=VALUE" (url-encoded query param); the function-call form is
+    # ".../delta(token='VALUE')". The old split("token='") idiom only matched the
+    # quoted form, so the token was silently never saved on a normal deltaLink and
+    # the next --delta re-enumerated the whole drive. Handle both forms.
+    if not delta_link:
+        return None
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        qs = parse_qs(urlparse(delta_link).query)
+        if qs.get("token"):
+            return unquote(qs["token"][0]).strip().strip("'")
+    except Exception:
+        pass
+    if "token='" in delta_link:
+        try:
+            return delta_link.split("token='")[1].split("'")[0]
+        except Exception:
+            return None
+    return None
 
 
 def _normalize_priority_folders(folders: list[str]) -> list[str]:
@@ -1178,6 +1237,128 @@ def run_full(force: bool = False) -> None:
 
         return results, submitted_count
 
+    def _run_resumable_full(exclude_path_prefixes=None):
+        """Resumable full-library index via the Graph delta cursor.
+
+        Walks the whole drive as a flat, paginated delta stream. Advances the
+        persisted cursor ONLY after a page's files are fully processed, so a
+        recycle/crash resumes at that page rather than re-walking from root.
+        Re-processing a page is idempotent (content-hash dedup + commit marker).
+        On @odata.deltaLink the cursor is cleared and the delta token is saved
+        for future incremental (--delta) runs.
+        """
+        GRAPH = "https://graph.microsoft.com/v1.0"
+        DELTA_START = (
+            f"{GRAPH}/me/drive/root/delta"
+            "?$select=id,name,file,folder,parentReference,lastModifiedDateTime,"
+            "createdDateTime,createdBy"
+        )
+        results: list[dict] = []
+        submitted = 0
+        seen = 0
+        page_no = 0
+
+        cursor = _load_full_cursor()
+        if cursor:
+            log.info("Full library (resumable) — resuming from saved cursor")
+        else:
+            cursor = DELTA_START
+            log.info("Full library (resumable) — starting fresh enumeration")
+
+        def _excluded_item(item) -> bool:
+            if not exclude_path_prefixes:
+                return False
+            parent = (item.get("parentReference") or {}).get("path", "")
+            if parent.startswith("/drive/root:"):
+                parent = parent[len("/drive/root:"):]
+            for pref in exclude_path_prefixes:
+                if parent == pref or parent.startswith(pref + "/"):
+                    return True
+            return False
+
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="proc-full")
+        restarted_from_root = False
+        try:
+            while cursor and not stop_event.is_set():
+                try:
+                    data = _graph_get_with_retry(cursor, tm)
+                except Exception as e:
+                    # A saved delta cursor (skiptoken) can expire (HTTP 410). Fall
+                    # back to a fresh enumeration once; dedup makes the redo safe.
+                    if cursor != DELTA_START and not restarted_from_root:
+                        log.warning("Full cursor fetch failed (%s) — restarting "
+                                    "enumeration from root", e)
+                        _clear_full_cursor()
+                        cursor = DELTA_START
+                        restarted_from_root = True
+                        continue
+                    raise
+
+                page_no += 1
+                page = data.get("value", [])
+                futures: list = []
+                for item in page:
+                    seen += 1
+                    if "file" not in item or "deleted" in item:
+                        continue
+                    name = item.get("name", "")
+                    if Path(name).suffix.lower() not in SUPPORTED_EXTS:
+                        continue
+                    if _is_excluded(name, exclusions) or _excluded_item(item):
+                        continue
+                    futures.append(pool.submit(_process_item, item, track_progress=False))
+                    submitted += 1
+                    while len(futures) >= MAX_IN_FLIGHT:
+                        done = [f for f in futures if f.done()]
+                        for f in done:
+                            results.append(f.result())
+                            futures.remove(f)
+                        if not done:
+                            import time as _t
+                            _t.sleep(0.05)
+                        if stop_event.is_set():
+                            break
+                    if stop_event.is_set():
+                        break
+
+                # Wait for this page's remaining files to commit before advancing.
+                for f in as_completed(futures):
+                    try:
+                        results.append(f.result())
+                    except Exception as e:
+                        log.error("Future failed during page drain: %s", e)
+
+                if stop_event.is_set():
+                    # Interrupted mid-page: do NOT advance the cursor. Resume
+                    # re-does this page; committed files dedup-skip, rest index.
+                    break
+
+                if "@odata.deltaLink" in data:
+                    dl = data["@odata.deltaLink"]
+                    tok = _extract_delta_token(dl)
+                    if tok:
+                        DELTA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        DELTA_TOKEN_FILE.write_text(json.dumps({"token": tok}))
+                    _clear_full_cursor()
+                    cursor = None
+                    log.info("Full library index COMPLETE — %d files submitted; "
+                             "delta token saved for incremental updates", submitted)
+                else:
+                    next_link = data.get("@odata.nextLink")
+                    if next_link:
+                        _save_full_cursor(next_link)
+                        cursor = next_link
+                        if page_no % 10 == 0:
+                            log.info("Full library (resumable): page %d, %d items "
+                                     "seen, %d files submitted", page_no, seen, submitted)
+                    else:
+                        _clear_full_cursor()
+                        cursor = None
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        return results, submitted
+
     all_results: list[dict] = []
     total_submitted = 0
 
@@ -1233,19 +1414,13 @@ def run_full(force: bool = False) -> None:
                         priority_folders = []
                         has_priority = False
 
-        # ── Phase 2: rest of the library (with priority folders excluded
-        # if we just finished phase 1; or full library if no priority) ────
+        # ── Phase 2: rest of the library (resumable full delta walk) ──────
         if not stop_event.is_set():
-            # If priority just completed, exclude those folders so we don't
-            # re-walk them (their files would dedup-skip anyway, but skipping
-            # the enumeration saves Graph API calls).
+            # Exclude priority folders if Phase 1 just completed them (their
+            # files would dedup-skip anyway; this avoids the redundant work).
             phase2_exclude = priority_folders if priority_folders else None
-            phase_label    = "Phase 2 (full library)" if priority_folders else "Full library"
-            p2_results, p2_submitted = _run_one_phase(
-                phase_label=phase_label,
-                start_urls=None,
+            p2_results, p2_submitted = _run_resumable_full(
                 exclude_path_prefixes=phase2_exclude,
-                track_progress=False,
             )
             all_results.extend(p2_results)
             total_submitted += p2_submitted
@@ -1315,7 +1490,7 @@ def run_delta() -> None:
         url = data.get("@odata.nextLink")
         if "@odata.deltaLink" in data:
             delta_link = data["@odata.deltaLink"]
-            new_token  = delta_link.split("token='")[1].rstrip("'") if "token='" in delta_link else None
+            new_token = _extract_delta_token(delta_link)
             break
 
     supported = [
