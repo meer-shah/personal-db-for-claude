@@ -61,6 +61,7 @@ SUPPORTED_EXTS   = {".docx", ".pdf", ".xlsx", ".pptx", ".txt", ".md", ".csv"}
 WORK_DIR         = Path("/var/pkp/work")
 DELTA_TOKEN_FILE = Path("/var/pkp/delta_token.json")
 FULL_CURSOR_FILE = Path("/var/pkp/full_cursor.json")
+PRIORITY_CURSOR_FILE = Path("/var/pkp/priority_cursor.json")
 EXCLUSIONS_FILE  = REPO_ROOT / "config" / "exclusions.txt"
 
 # Bad-file quarantine: persistent ledger of files that have repeatedly failed
@@ -567,6 +568,7 @@ def _clear_priority_file() -> None:
                 PRIORITY_FILE.unlink()
         except Exception as e:
             log.warning("Could not delete priority file: %s", e)
+    _clear_cursor(PRIORITY_CURSOR_FILE)
 
 
 def _record_phase1_interrupt(made_progress: bool) -> int:
@@ -596,31 +598,43 @@ def _record_phase1_interrupt(made_progress: bool) -> int:
 # files). On reaching @odata.deltaLink the cursor is cleared and the delta token
 # is saved for future incremental (--delta) runs.
 
-def _load_full_cursor():
+def _load_cursor(path):
     try:
-        if FULL_CURSOR_FILE.exists():
-            return json.loads(FULL_CURSOR_FILE.read_text()).get("url")
+        if path.exists():
+            return json.loads(path.read_text()).get("url")
     except Exception as e:
-        log.warning("Could not read full cursor (%s) — starting fresh", e)
+        log.warning("Could not read cursor %s (%s) — starting fresh", path, e)
     return None
 
 
-def _save_full_cursor(url: str) -> None:
+def _save_cursor(path, url: str) -> None:
     try:
-        FULL_CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = FULL_CURSOR_FILE.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps({"url": url}))
-        tmp.replace(FULL_CURSOR_FILE)
+        tmp.replace(path)
     except Exception as e:
-        log.warning("Could not persist full cursor: %s", e)
+        log.warning("Could not persist cursor %s: %s", path, e)
+
+
+def _clear_cursor(path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        log.warning("Could not delete cursor %s: %s", path, e)
+
+
+def _load_full_cursor():
+    return _load_cursor(FULL_CURSOR_FILE)
+
+
+def _save_full_cursor(url: str) -> None:
+    _save_cursor(FULL_CURSOR_FILE, url)
 
 
 def _clear_full_cursor() -> None:
-    try:
-        if FULL_CURSOR_FILE.exists():
-            FULL_CURSOR_FILE.unlink()
-    except Exception as e:
-        log.warning("Could not delete full cursor: %s", e)
+    _clear_cursor(FULL_CURSOR_FILE)
 
 
 def _extract_delta_token(delta_link: str):
@@ -1237,15 +1251,20 @@ def run_full(force: bool = False) -> None:
 
         return results, submitted_count
 
-    def _run_resumable_full(exclude_path_prefixes=None):
-        """Resumable full-library index via the Graph delta cursor.
+    def _run_resumable_full(exclude_path_prefixes=None, include_only_prefixes=None,
+                            cursor_file=FULL_CURSOR_FILE, save_delta_token=True,
+                            label="Full library"):
+        """Resumable delta-cursor index pass.
 
-        Walks the whole drive as a flat, paginated delta stream. Advances the
-        persisted cursor ONLY after a page's files are fully processed, so a
-        recycle/crash resumes at that page rather than re-walking from root.
-        Re-processing a page is idempotent (content-hash dedup + commit marker).
-        On @odata.deltaLink the cursor is cleared and the delta token is saved
-        for future incremental (--delta) runs.
+        Walks the whole drive as a flat, paginated Graph delta stream and
+        processes the files matching the filter (include_only_prefixes /
+        exclude_path_prefixes). Advances the persisted cursor (cursor_file) ONLY
+        after a page's files are fully committed, so a recycle/crash resumes at
+        that page rather than re-walking from root. Re-processing a page is
+        idempotent (content-hash dedup + commit marker). On @odata.deltaLink the
+        cursor is cleared (and the delta token saved if save_delta_token).
+        Returns (results, submitted, completed) — completed is True only if
+        enumeration reached the end (deltaLink/no nextLink).
         """
         GRAPH = "https://graph.microsoft.com/v1.0"
         DELTA_START = (
@@ -1257,26 +1276,25 @@ def run_full(force: bool = False) -> None:
         submitted = 0
         seen = 0
         page_no = 0
+        completed = False
 
-        cursor = _load_full_cursor()
+        cursor = _load_cursor(cursor_file)
         if cursor:
-            log.info("Full library (resumable) — resuming from saved cursor")
+            log.info("%s (resumable) — resuming from saved cursor", label)
         else:
             cursor = DELTA_START
-            log.info("Full library (resumable) — starting fresh enumeration")
+            log.info("%s (resumable) — starting fresh enumeration", label)
 
-        def _excluded_item(item) -> bool:
-            if not exclude_path_prefixes:
-                return False
+        def _matches(item, prefixes) -> bool:
             parent = (item.get("parentReference") or {}).get("path", "")
             if parent.startswith("/drive/root:"):
                 parent = parent[len("/drive/root:"):]
-            for pref in exclude_path_prefixes:
+            for pref in prefixes:
                 if parent == pref or parent.startswith(pref + "/"):
                     return True
             return False
 
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="proc-full")
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="proc-idx")
         restarted_from_root = False
         try:
             while cursor and not stop_event.is_set():
@@ -1286,9 +1304,9 @@ def run_full(force: bool = False) -> None:
                     # A saved delta cursor (skiptoken) can expire (HTTP 410). Fall
                     # back to a fresh enumeration once; dedup makes the redo safe.
                     if cursor != DELTA_START and not restarted_from_root:
-                        log.warning("Full cursor fetch failed (%s) — restarting "
-                                    "enumeration from root", e)
-                        _clear_full_cursor()
+                        log.warning("%s cursor fetch failed (%s) — restarting "
+                                    "enumeration from root", label, e)
+                        _clear_cursor(cursor_file)
                         cursor = DELTA_START
                         restarted_from_root = True
                         continue
@@ -1304,7 +1322,11 @@ def run_full(force: bool = False) -> None:
                     name = item.get("name", "")
                     if Path(name).suffix.lower() not in SUPPORTED_EXTS:
                         continue
-                    if _is_excluded(name, exclusions) or _excluded_item(item):
+                    if _is_excluded(name, exclusions):
+                        continue
+                    if include_only_prefixes and not _matches(item, include_only_prefixes):
+                        continue
+                    if exclude_path_prefixes and _matches(item, exclude_path_prefixes):
                         continue
                     futures.append(pool.submit(_process_item, item, track_progress=False))
                     submitted += 1
@@ -1334,93 +1356,78 @@ def run_full(force: bool = False) -> None:
                     break
 
                 if "@odata.deltaLink" in data:
-                    dl = data["@odata.deltaLink"]
-                    tok = _extract_delta_token(dl)
-                    if tok:
-                        DELTA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-                        DELTA_TOKEN_FILE.write_text(json.dumps({"token": tok}))
-                    _clear_full_cursor()
+                    if save_delta_token:
+                        tok = _extract_delta_token(data["@odata.deltaLink"])
+                        if tok:
+                            DELTA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+                            DELTA_TOKEN_FILE.write_text(json.dumps({"token": tok}))
+                    _clear_cursor(cursor_file)
                     cursor = None
-                    log.info("Full library index COMPLETE — %d files submitted; "
-                             "delta token saved for incremental updates", submitted)
+                    completed = True
+                    log.info("%s index COMPLETE — %d files submitted", label, submitted)
                 else:
                     next_link = data.get("@odata.nextLink")
                     if next_link:
-                        _save_full_cursor(next_link)
+                        _save_cursor(cursor_file, next_link)
                         cursor = next_link
                         if page_no % 10 == 0:
-                            log.info("Full library (resumable): page %d, %d items "
-                                     "seen, %d files submitted", page_no, seen, submitted)
+                            log.info("%s (resumable): page %d, %d items seen, "
+                                     "%d files submitted", label, page_no, seen, submitted)
                     else:
-                        _clear_full_cursor()
+                        _clear_cursor(cursor_file)
                         cursor = None
+                        completed = True
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
 
-        return results, submitted
+        return results, submitted, completed
 
     all_results: list[dict] = []
     total_submitted = 0
 
     try:
-        # ── Phase 1: priority folders (if any) ────────────────────────────
+        # ── Phase 1: priority folders first (resumable, filtered walk) ────
         if has_priority:
-            phase1_start_urls: list[str] = []
-            for folder in priority_folders:
-                url = _resolve_path_to_folder_url(tm, folder)
-                if url:
-                    phase1_start_urls.append(url)
-                else:
+            p1_results, p1_submitted, p1_completed = _run_resumable_full(
+                include_only_prefixes=priority_folders,
+                cursor_file=PRIORITY_CURSOR_FILE,
+                save_delta_token=False,
+                label="Phase 1 (priority)",
+            )
+            all_results.extend(p1_results)
+            total_submitted += p1_submitted
+
+            if p1_completed:
+                log.info("Phase 1 complete — priority folders fully indexed. "
+                         "Continuing with the rest of the library...")
+                _clear_priority_file()
+                has_priority = False  # phase 2 should not exclude anymore
+            elif recycle_event.is_set():
+                # Interrupted by a recycle. Phase 1 is now resumable — its cursor
+                # resumes next run — so normally we just exit and continue. The
+                # interrupt counter is a safety net: only if Phase 1 makes NO
+                # progress for PHASE1_MAX_INTERRUPTS recycles (e.g. a single page
+                # that cannot fit in memory) do we abandon priority ordering and
+                # let the full walk cover those files rather than blocking.
+                made_progress = any(r.get("status") == "ok" for r in p1_results)
+                n = _record_phase1_interrupt(made_progress)
+                if not made_progress and n >= PHASE1_MAX_INTERRUPTS:
                     log.error(
-                        "Priority folder %r unreachable — skipping it. "
-                        "Other priority folders and the full sweep will continue.",
-                        folder,
-                    )
-
-            if phase1_start_urls:
-                p1_results, p1_submitted = _run_one_phase(
-                    phase_label="Phase 1 (priority)",
-                    start_urls=phase1_start_urls,
-                    exclude_path_prefixes=None,
-                    track_progress=True,
-                )
-                all_results.extend(p1_results)
-                total_submitted += p1_submitted
-
-                if not stop_event.is_set():
-                    log.info(
-                        "Phase 1 complete — priority folders indexed. "
-                        "System is searchable now. Continuing with full library...",
+                        "Phase 1 made no progress across %d recycles — abandoning "
+                        "priority ordering; the full walk will cover these files.", n,
                     )
                     _clear_priority_file()
-                    has_priority = False  # phase 2 should not exclude anymore
-                elif recycle_event.is_set():
-                    # Phase 1 was cut short by a memory recycle before completing.
-                    # If this keeps happening with no new files indexed, the
-                    # priority walk can't finish within the RSS budget and we'd
-                    # loop on Phase 1 forever, never reaching Phase 2. Track it,
-                    # and after PHASE1_MAX_INTERRUPTS give up the priority-first
-                    # ordering: clear priority so the next run does a normal full
-                    # walk (which makes incremental forward progress).
-                    made_progress = any(r.get("status") == "ok" for r in p1_results)
-                    n = _record_phase1_interrupt(made_progress)
-                    if not made_progress and n >= PHASE1_MAX_INTERRUPTS:
-                        log.error(
-                            "Phase 1 interrupted by recycle %d times without indexing "
-                            "any new file — abandoning priority-first ordering and "
-                            "clearing priority; next run does a full-library walk.", n,
-                        )
-                        _clear_priority_file()
-                        priority_folders = []
-                        has_priority = False
+                    priority_folders = []
+                    has_priority = False
 
-        # ── Phase 2: rest of the library (resumable full delta walk) ──────
+        # ── Phase 2: rest of the library (resumable, priority excluded) ───
         if not stop_event.is_set():
-            # Exclude priority folders if Phase 1 just completed them (their
-            # files would dedup-skip anyway; this avoids the redundant work).
             phase2_exclude = priority_folders if priority_folders else None
-            p2_results, p2_submitted = _run_resumable_full(
+            p2_results, p2_submitted, _ = _run_resumable_full(
                 exclude_path_prefixes=phase2_exclude,
+                cursor_file=FULL_CURSOR_FILE,
+                save_delta_token=True,
+                label="Phase 2 (full library)" if priority_folders else "Full library",
             )
             all_results.extend(p2_results)
             total_submitted += p2_submitted
@@ -1968,6 +1975,7 @@ def _cmd_set_priority(folders: list[str]) -> None:
         }
         _save_priority()
 
+    _clear_cursor(PRIORITY_CURSOR_FILE)  # new priority => fresh cursor
     log.info("Priority set to %s", normalized)
     log.info("Restart pkp-full-indexer to begin priority indexing.")
 
