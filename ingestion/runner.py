@@ -1065,6 +1065,22 @@ def _is_in_priority(od_path: str, priority_folders: list[str]) -> bool:
 
 # ── Core: process one file ────────────────────────────────────────────────────
 
+def _iter_file_chunks(local_path: str):
+    """Yield a file's chunks one at a time: parse -> chunk_texts per raw
+    item, with a globally increasing chunk_index. This is the unit the embed
+    pipeline batches over. Batching raw PARSER ITEMS (the old way) let a file
+    that parses into FEW but HUGE items embed all-at-once: a 19MB .txt is ONE
+    raw item that explodes into ~12K chunks, so its single un-instrumented
+    embed showed no progress for >15 min and the no-progress watchdog WRONGLY
+    quarantined it. Yielding chunks lets process_file batch + heartbeat per
+    embed regardless of how few/large the raw items are."""
+    idx = 0
+    for raw_item in _parse_file(local_path):
+        chs = chunk_texts([raw_item], start_index=idx)
+        idx += len(chs)
+        yield from chs
+
+
 def process_file(
     client: QdrantClient,
     local_path: str,
@@ -1140,7 +1156,7 @@ def process_file(
         # Chunk 0 is committed only after the LAST batch, so a crash mid-stream
         # leaves committed=False and the existing dedup reprocesses the file.
         try:
-            _stream = _batched(_parse_file(local_path), EMBED_BATCH)
+            _stream = _batched(_iter_file_chunks(local_path), EMBED_BATCH)
         except Exception as e:
             n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}", immediate=True)
             log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
@@ -1150,7 +1166,7 @@ def process_file(
         total = 0
         while True:
             try:
-                raw_batch = next(_stream)
+                chunk_batch = next(_stream)
             except StopIteration:
                 break
             except Exception as e:
@@ -1164,8 +1180,7 @@ def process_file(
                 return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
             try:
-                chunked  = chunk_texts(raw_batch, start_index=total)
-                embedded = embed_chunks(chunked)
+                embedded = embed_chunks(chunk_batch)
             except Exception as e:
                 if deleted:
                     try:

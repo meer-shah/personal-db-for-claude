@@ -83,6 +83,23 @@ def test_streaming_empty_no_delete_no_commit(monkeypatch, tmp_path):
     assert calls["upserts"] == []
 
 
+def test_streaming_single_big_item_is_batched(monkeypatch, tmp_path):
+    # A SINGLE raw item (a 19MB .txt is ONE parse item) that explodes into many
+    # chunks must still embed in multiple bounded batches WITH a heartbeat per
+    # batch -- otherwise its one un-instrumented embed shows no progress and the
+    # watchdog wrongly quarantines it. (The BSEG .txt regression.)
+    calls = _setup(monkeypatch, tmp_path, n_raw=1, batch=5)
+    big_text = "word " * 6000          # ~6000 tokens -> ~13 chunks at 512/chunk
+    monkeypatch.setattr(r, "_parse_file", lambda p: [{"type": "text", "text": big_text}])
+    res = _run(tmp_path)
+    assert res["status"] == "ok"
+    assert res["chunks"] > 5            # one raw item -> many chunks
+    assert len(calls["upserts"]) >= 2   # embedded across MULTIPLE bounded batches
+    assert calls["touch"] >= 2          # progress heartbeat per batch
+    assert calls["delete"] == 1 and calls["commit"] == 1
+    assert calls["indices"] == list(range(res["chunks"]))   # globally unique chunk_index
+
+
 def test_streaming_embed_failure_quarantines_and_cleans(monkeypatch, tmp_path):
     calls = _setup(monkeypatch, tmp_path, n_raw=12, batch=5)
     recorded = {}
