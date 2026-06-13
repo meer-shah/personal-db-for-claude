@@ -73,6 +73,18 @@ EXCLUSIONS_FILE  = REPO_ROOT / "config" / "exclusions.txt"
 QUARANTINE_FILE      = Path("/var/pkp/bad_files.json")
 QUARANTINE_THRESHOLD = 3
 
+# Crash-recovery breadcrumbs: a file that KILLS the process (OOM / memory
+# recycle mid-embed) is never caught by the parse/embed try/except, so it is
+# never quarantined and re-attempts on every restart -- an infinite loop.
+# Each worker drops a breadcrumb naming the (large) file it is about to
+# process BEFORE the heavy work; _recover_inflight() reads any leftover
+# breadcrumb on the next startup (= a file in-flight when we were killed) and
+# counts a failure strike, so a repeat killer reaches QUARANTINE_THRESHOLD
+# and is skipped. Only files >= PKP_BREADCRUMB_MIN_MB are tracked (tiny docs
+# can't spike memory) to keep the hot path write-free.
+INFLIGHT_DIR      = Path("/var/pkp/inflight")
+BREADCRUMB_MIN_MB = float(os.getenv("PKP_BREADCRUMB_MIN_MB", "1.0"))
+
 # Priority indexing: a user can designate one or more OneDrive folders to be
 # indexed FIRST, before the rest of the library. This lets them test searches
 # against real content within minutes instead of waiting for a full library
@@ -520,6 +532,86 @@ def _clear_failure(onedrive_item_id: str) -> None:
             _save_quarantine()
 
 
+# -- Crash-recovery breadcrumbs ------------------------------------------------
+
+def _breadcrumb_tag() -> str:
+    """A filesystem-safe tag for the current worker thread."""
+    name = _threading.current_thread().name
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+
+
+def _breadcrumb_start(tag: str, onedrive_item_id: str, file_name: str, content_hash) -> None:
+    """Drop a marker naming the file this worker is about to process. Written
+    (atomically) BEFORE the heavy work so it survives an uncatchable kill."""
+    try:
+        INFLIGHT_DIR.mkdir(parents=True, exist_ok=True)
+        p   = INFLIGHT_DIR / (tag + ".json")
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "onedrive_item_id": onedrive_item_id,
+            "file_name":        file_name,
+            "content_hash":     content_hash,
+        }))
+        tmp.replace(p)
+    except Exception as e:
+        log.warning("breadcrumb write failed (%s): %s", file_name, e)
+
+
+def _breadcrumb_clear(tag: str) -> None:
+    """Remove this worker's breadcrumb once the file finishes (ok OR caught
+    error). Only a hard kill leaves it behind for _recover_inflight()."""
+    try:
+        p = INFLIGHT_DIR / (tag + ".json")
+        if p.exists():
+            p.unlink()
+    except Exception as e:
+        log.warning("breadcrumb clear failed: %s", e)
+
+
+def _recover_inflight() -> None:
+    """Run once at startup. Any leftover breadcrumb names a file that was being
+    processed when the previous run was killed (OOM / recycle) before it could
+    be caught and quarantined. Count a failure strike for each so a repeat
+    process-killer reaches QUARANTINE_THRESHOLD and is skipped, then clear all
+    breadcrumbs. Strikes on innocent in-flight files are harmless -- they reset
+    via _clear_failure the next time the file processes cleanly."""
+    recovered: list[str] = []
+    try:
+        if not INFLIGHT_DIR.exists():
+            return
+        for p in sorted(INFLIGHT_DIR.glob("*.json")):
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+                continue
+            oid   = data.get("onedrive_item_id")
+            name  = data.get("file_name", "?")
+            chash = data.get("content_hash")
+            if oid:
+                n = _record_failure(
+                    oid, name, chash,
+                    "process was killed while processing this file (likely OOM/memory recycle)",
+                    immediate=False,
+                )
+                recovered.append(name + " (strike " + str(n) + "/" + str(QUARANTINE_THRESHOLD) + ")")
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("inflight recovery failed: %s", e)
+    if recovered:
+        log.warning(
+            "CRASH-RECOVERY: %d file(s) were mid-process at last exit; recorded a "
+            "failure strike each (%d strikes => quarantined): %s",
+            len(recovered), QUARANTINE_THRESHOLD, "; ".join(recovered[:10]),
+        )
+
+
 # ── Priority indexing ─────────────────────────────────────────────────────────
 
 # Module-level cache + lock. The priority file is read once at startup and
@@ -898,67 +990,76 @@ def process_file(
             "error": f"quarantined after {q_entry.get('fail_count', 0)} failures: {q_entry.get('last_error', '')}",
         }
 
+    # Crash-recovery breadcrumb (large files only): if this file kills the
+    # process mid-embed, _recover_inflight() quarantines it on next startup.
+    _bc_tag = _breadcrumb_tag() if _size_mb >= BREADCRUMB_MIN_MB else None
+    if _bc_tag:
+        _breadcrumb_start(_bc_tag, onedrive_item_id, file_name, file_hash)
     try:
-        raw_chunks = _parse_file(local_path)
-    except Exception as e:
-        n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}", immediate=True)
-        log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
-        return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
-
-    if not raw_chunks:
-        # Empty isn't a "bad file" — clear any stale failures (file may have
-        # been re-saved as legitimately empty).
-        _clear_failure(onedrive_item_id)
         try:
-            _eb = Path(local_path).stat().st_size
-        except OSError:
-            _eb = -1
-        log.info("EMPTY %s (type=%s, %d bytes - no text extracted)", file_name, file_type, _eb)
-        return {"file": file_name, "status": "empty", "chunks": 0, "error": None}
+            raw_chunks = _parse_file(local_path)
+        except Exception as e:
+            n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}", immediate=True)
+            log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
+            return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
-    try:
-        chunked  = chunk_texts(raw_chunks)
-        embedded = embed_chunks(chunked)
-    except Exception as e:
-        n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}", immediate=True)
-        log.error("CHUNK/EMBED ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
-        return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
+        if not raw_chunks:
+            # Empty isn't a "bad file" — clear any stale failures (file may have
+            # been re-saved as legitimately empty).
+            _clear_failure(onedrive_item_id)
+            try:
+                _eb = Path(local_path).stat().st_size
+            except OSError:
+                _eb = -1
+            log.info("EMPTY %s (type=%s, %d bytes - no text extracted)", file_name, file_type, _eb)
+            return {"file": file_name, "status": "empty", "chunks": 0, "error": None}
 
-    chunks: list[Chunk] = []
-    for ec in embedded:
-        chunks.append(Chunk(
-            text             = ec["text"],
-            chunk_type       = ec.get("type", "text"),
-            file_path        = file_path,
-            file_name        = file_name,
-            file_type        = file_type,
-            onedrive_item_id = onedrive_item_id,
-            modified_date    = modified_date,
-            created_date     = created_date,
-            content_hash     = file_hash,
-            chunk_index      = ec["chunk_index"],
-            author           = author,
-            page_number      = ec.get("page_number") or ec.get("page"),
-            slide_number     = ec.get("slide_number"),
-            sheet_name       = ec.get("sheet_name"),
-            vector           = ec["vector"],
-        ))
+        try:
+            chunked  = chunk_texts(raw_chunks)
+            embedded = embed_chunks(chunked)
+        except Exception as e:
+            n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}", immediate=True)
+            log.error("CHUNK/EMBED ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
+            return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
-    try:
-        # Delete old chunks first so stale points don't accumulate
-        _delete_item_chunks(client, onedrive_item_id)
-        _upsert_chunks(client, chunks)
-    except Exception as e:
-        # Qdrant errors are typically transient (network, server restart) —
-        # don't count them toward quarantine. The next run will retry.
-        log.error("QDRANT ERROR  %s: %s", file_name, e)
-        return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
+        chunks: list[Chunk] = []
+        for ec in embedded:
+            chunks.append(Chunk(
+                text             = ec["text"],
+                chunk_type       = ec.get("type", "text"),
+                file_path        = file_path,
+                file_name        = file_name,
+                file_type        = file_type,
+                onedrive_item_id = onedrive_item_id,
+                modified_date    = modified_date,
+                created_date     = created_date,
+                content_hash     = file_hash,
+                chunk_index      = ec["chunk_index"],
+                author           = author,
+                page_number      = ec.get("page_number") or ec.get("page"),
+                slide_number     = ec.get("slide_number"),
+                sheet_name       = ec.get("sheet_name"),
+                vector           = ec["vector"],
+            ))
 
-    # Successful end-to-end — clear any prior quarantine state for this file.
-    _clear_failure(onedrive_item_id)
+        try:
+            # Delete old chunks first so stale points don't accumulate
+            _delete_item_chunks(client, onedrive_item_id)
+            _upsert_chunks(client, chunks)
+        except Exception as e:
+            # Qdrant errors are typically transient (network, server restart) —
+            # don't count them toward quarantine. The next run will retry.
+            log.error("QDRANT ERROR  %s: %s", file_name, e)
+            return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
-    log.info("OK    %s → %d chunks", file_name, len(chunks))
-    return {"file": file_name, "status": "ok", "chunks": len(chunks), "error": None}
+        # Successful end-to-end — clear any prior quarantine state for this file.
+        _clear_failure(onedrive_item_id)
+
+        log.info("OK    %s → %d chunks", file_name, len(chunks))
+        return {"file": file_name, "status": "ok", "chunks": len(chunks), "error": None}
+    finally:
+        if _bc_tag:
+            _breadcrumb_clear(_bc_tag)
 
 # ── Local mode ────────────────────────────────────────────────────────────────
 
@@ -1038,6 +1139,11 @@ def run_full(force: bool = False) -> None:
     client = _get_qdrant()
     _ensure_collection(client)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Crash-recovery: strike any file that was mid-process when a previous
+    # run was killed (OOM / recycle) before it could be caught + quarantined.
+    _recover_inflight()
+
     # Clean up any leftover temp files from a previous crashed run.
     for f in WORK_DIR.glob("*"):
         try:
@@ -1460,6 +1566,9 @@ def run_delta() -> None:
             f.unlink()
         except OSError:
             pass
+
+    # Crash-recovery: see run_full -- strike any file mid-process at last kill.
+    _recover_inflight()
 
     tm    = TokenManager()
     GRAPH = "https://graph.microsoft.com/v1.0"
