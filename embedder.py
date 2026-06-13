@@ -1,6 +1,11 @@
 import threading
 
 import torch
+# One intra-op thread per worker. Parallelism comes from PKP_INGEST_WORKERS
+# (~= CPU cores), NOT from each encode spawning torch's default N threads. The
+# old setup (12 workers x 4 torch threads = 48 threads on 16 cores) thrashed
+# the CPU; pinning to 1 lets N workers each peg one core cleanly.
+torch.set_num_threads(1)
 from sentence_transformers import SentenceTransformer
 
 _MODEL_NAME = "all-MiniLM-L6-v2"

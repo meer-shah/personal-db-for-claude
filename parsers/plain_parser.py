@@ -1,9 +1,24 @@
 import csv
+import sys
 
 import tiktoken
 
 _enc = tiktoken.get_encoding("cl100k_base")
 _MAX_TOKENS = 400  # leave headroom for the model's 256 word-piece limit
+
+# SAP/CSV exports can contain a single cell larger than Python's 128 KB default
+# csv field limit. Without this, ONE oversized cell raises
+# "field larger than field limit" and quarantines the WHOLE file (silently
+# dropped). Raise the limit so the row parses; the chunker's hard token cap then
+# splits the resulting large chunk normally. Guard OverflowError on platforms
+# whose C long is smaller than sys.maxsize.
+_fsl = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_fsl)
+        break
+    except OverflowError:
+        _fsl //= 10
 
 
 def parse_plain(file_path: str):

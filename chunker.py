@@ -45,6 +45,26 @@ def chunk_texts(texts: list[dict], start_index: int = 0) -> list[dict]:
     return result
 
 
+_ENC_WINDOW = 16384  # chars; cap tiktoken input per call
+
+
+def _encode_bounded(text: str) -> list[int]:
+    """
+    tiktoken's BPE is ~quadratic on a single huge whitespace-free run (a 5MB
+    no-newline/base64/minified blob wedged encode for >25s in testing). Encode
+    in bounded character windows so no single call sees a giant contiguous
+    piece. encode/decode round-trips bytes, so concatenating per-window tokens
+    still decodes to the exact original text — only chunk boundaries shift
+    slightly. Small text (the common path) skips windowing entirely.
+    """
+    if len(text) <= _ENC_WINDOW:
+        return _enc.encode(text)
+    out: list[int] = []
+    for i in range(0, len(text), _ENC_WINDOW):
+        out.extend(_enc.encode(text[i:i + _ENC_WINDOW]))
+    return out
+
+
 def _split_tokens(text: str, overlap: int) -> list[str]:
     """
     Split text into <=MAX_TOKENS-token pieces.
@@ -53,7 +73,7 @@ def _split_tokens(text: str, overlap: int) -> list[str]:
     path), so normal chunks are byte-for-byte identical to before. Only
     pathologically large chunks are split.
     """
-    tokens = _enc.encode(text)
+    tokens = _encode_bounded(text)
     if len(tokens) <= MAX_TOKENS:
         return [text]
 

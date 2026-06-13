@@ -49,6 +49,13 @@ from qdrant_client.models import (
 # the model load forever (the 45-min CLOSE-WAIT hang). Must be set BEFORE
 # importing the embedder (which imports sentence_transformers/huggingface_hub).
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+# One intra-op thread per worker; parallelism comes from PKP_INGEST_WORKERS
+# (~= CPU cores), not from each encode spawning N threads. The old default
+# (12 workers x 4 torch threads = 48 threads on a 16-core box) thrashed the
+# CPU. Set BEFORE torch is imported (via the embedder, below) so they take.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from chunker import chunk_texts
 from embedder import embed_chunks, warmup as _embedder_warmup
@@ -1391,7 +1398,7 @@ def run_full(force: bool = False) -> None:
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
 
-    workers = int(os.getenv("PKP_INGEST_WORKERS", "12"))
+    workers = int(os.getenv("PKP_INGEST_WORKERS", str(os.cpu_count() or 8)))
     MAX_IN_FLIGHT = workers * 4
     rss_ceiling_mb = _rss_ceiling_mb()
     recycle_event = threading.Event()
