@@ -147,7 +147,7 @@ def test_plain_txt(tmp_path):
     from parsers.plain_parser import parse_plain
     p = tmp_path / "notes.txt"
     p.write_text("Hello world\nLine two")
-    chunks = parse_plain(str(p))
+    chunks = list(parse_plain(str(p)))
     assert len(chunks) == 1
     assert chunks[0]["type"] == "text"
     assert "Hello world" in chunks[0]["text"]
@@ -157,7 +157,7 @@ def test_plain_csv_as_table(tmp_path):
     from parsers.plain_parser import parse_plain
     p = tmp_path / "data.csv"
     p.write_text("Name,Score\nAlice,90\nBob,85\n")
-    chunks = parse_plain(str(p))
+    chunks = list(parse_plain(str(p)))
     assert len(chunks) == 1
     assert chunks[0]["type"] == "table"
     assert "Name" in chunks[0]["text"]

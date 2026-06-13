@@ -5,7 +5,7 @@ MAX_TOKENS = 512
 OVERLAP = 50
 
 
-def chunk_texts(texts: list[dict]) -> list[dict]:
+def chunk_texts(texts: list[dict], start_index: int = 0) -> list[dict]:
     """
     Accept the raw output from any parser (list of dicts with 'type' and 'text')
     and return a flat list of chunk dicts ready for embedding.
@@ -15,17 +15,20 @@ def chunk_texts(texts: list[dict]) -> list[dict]:
     Tables are normally emitted as one chunk each (parsers already batch rows
     under their own token budget, so a normal table fits and is byte-for-byte
     unchanged). As a HARD SAFETY CAP, any single chunk -- table OR text --
-    larger than MAX_TOKENS is split before it can reach the embedder. A single
-    oversized chunk (a CSV/XLSX row with a huge cell, a giant PDF page) would
-    otherwise force the embedder to tokenize one enormous string, spiking RSS
-    into the recycle ceiling and killing the process mid-embed. Splitting
-    guarantees every chunk handed to the model is bounded.
+    larger than MAX_TOKENS is split before it can reach the embedder.
+
+    `start_index` is the chunk_index to assign to the FIRST output chunk. The
+    streaming pipeline calls chunk_texts once per batch and passes the running
+    total so chunk_index stays globally unique within a file (the deterministic
+    point id is uuid5(item_id:chunk_index) — colliding indexes across batches
+    would overwrite each other in Qdrant). Default 0 preserves the all-at-once
+    behaviour for every existing caller.
 
     Each output dict preserves all keys from the input dict and adds:
         chunk_index - position of this chunk within the file's output list
     """
     result: list[dict] = []
-    idx = 0
+    idx = start_index
 
     for item in texts:
         chunk_type = item.get("type", "text")

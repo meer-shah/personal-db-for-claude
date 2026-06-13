@@ -6,15 +6,18 @@ _enc = tiktoken.get_encoding("cl100k_base")
 _MAX_TOKENS = 400  # leave headroom for the model's 256 word-piece limit
 
 
-def parse_plain(file_path: str) -> list[dict]:
+def parse_plain(file_path: str):
     """
-    Parse .txt and .md files as a single text chunk (the chunker splits it).
-    Parse .csv files as a STREAM of TABLE chunks, each batched under
-    _MAX_TOKENS so a large CSV never becomes one giant chunk.
+    Parse .txt and .md files as a single text chunk (returned as a list; the
+    chunker splits it). Parse .csv files as a STREAM of TABLE chunks via a
+    generator, each batched under _MAX_TOKENS, so a large CSV never becomes one
+    giant chunk AND is never fully materialized in memory.
 
-    Returns a list of dicts with keys:
+    Returns an *iterable* of dicts with keys:
         type  - 'text' or 'table'
         text  - raw string content
+    (a list for .txt/.md, a generator for .csv — the streaming ingest pipeline
+    consumes either with itertools batching.)
     """
     lower = file_path.lower()
 
@@ -30,39 +33,30 @@ def parse_plain(file_path: str) -> list[dict]:
     return [{"type": "text", "text": content}]
 
 
-def _parse_csv(file_path: str) -> list[dict]:
+def _parse_csv(file_path: str):
     """
-    Stream a CSV into TABLE chunks of at most _MAX_TOKENS tokens each, mirroring
-    the xlsx parser.
+    Stream a CSV into TABLE chunks of at most _MAX_TOKENS tokens each (mirrors
+    the xlsx parser), yielding one chunk at a time.
 
-    Why this matters: a 15 MB SAP export used to be turned into a SINGLE ~15 MB
-    chunk (the chunker never split tables). The embedder then had to tokenize
-    one enormous string, which spiked RSS into the recycle ceiling and KILLED
-    the process mid-embed -- before the file could even be quarantined, so it
-    re-attempted on every restart and the indexer looped forever. Batching rows
-    keeps every chunk small and bounded, so embedding never spikes.
-
-    The header line is repeated at the top of each chunk so each chunk is
-    self-describing for retrieval. DictReader streams row-by-row, so we never
-    hold the whole file as one giant string either.
+    Why a generator: a 252 MB SAP export is ~1.1 M chunks. Building that whole
+    list before embedding spiked memory; embedding it all-at-once spiked it
+    further and the process was killed mid-embed. Yielding lets the ingest
+    pipeline embed + upsert each batch and free it, so peak memory is bounded
+    by one batch regardless of file size. The header line is repeated at the
+    top of each chunk so each chunk is self-describing for retrieval; DictReader
+    streams row-by-row so the raw file is never fully held either.
     """
-    chunks: list[dict] = []
-
     with open(file_path, encoding="utf-8", errors="replace", newline="") as f:
         reader = csv.DictReader(f)
         headers = [h for h in (reader.fieldnames or []) if h]
         if not headers:
-            return []
+            return
 
         header_line = "TABLE: " + " | ".join(headers)
         base_tokens = len(_enc.encode(header_line))
 
         batch_lines: list[str] = []
         batch_tokens = base_tokens
-
-        def _flush(lines, _hdr=header_line):
-            if lines:
-                chunks.append({"type": "table", "text": _hdr + "\n" + "\n".join(lines)})
 
         for row in reader:
             row_lines = [f"{h}: {str(row.get(h, '') or '').strip()}" for h in headers]
@@ -73,13 +67,12 @@ def _parse_csv(file_path: str) -> list[dict]:
             # A single row larger than the budget becomes its own chunk; the
             # chunker's hard cap splits it further if even one row is huge.
             if batch_lines and batch_tokens + row_tokens > _MAX_TOKENS:
-                _flush(batch_lines)
+                yield {"type": "table", "text": header_line + "\n" + "\n".join(batch_lines)}
                 batch_lines = []
                 batch_tokens = base_tokens
 
             batch_lines.extend(row_lines)
             batch_tokens += row_tokens
 
-        _flush(batch_lines)
-
-    return chunks
+        if batch_lines:
+            yield {"type": "table", "text": header_line + "\n" + "\n".join(batch_lines)}

@@ -20,6 +20,10 @@ import os
 import re
 import sys
 import uuid
+import faulthandler
+import signal
+import time
+from itertools import islice
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,8 +45,32 @@ from qdrant_client.models import (
     HnswConfigDiff,
 )
 
+# Bound any HuggingFace network call so a half-closed connection can't wedge
+# the model load forever (the 45-min CLOSE-WAIT hang). Must be set BEFORE
+# importing the embedder (which imports sentence_transformers/huggingface_hub).
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "15")
+
 from chunker import chunk_texts
-from embedder import embed_chunks
+from embedder import embed_chunks, warmup as _embedder_warmup
+
+# Dump every thread's stack on SIGUSR1 (kill -USR1 <pid>) so a future hang
+# is diagnosable on demand instead of a black box.
+try:
+    faulthandler.enable()
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
+
+
+def _batched(iterable, n: int):
+    """Yield lists of up to n items from any iterable (list OR generator).
+    Used to stream a file's chunks through embed+upsert in bounded batches."""
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, n))
+        if not batch:
+            return
+        yield batch
 from models.chunk import Chunk
 from parsers.docx_parser import parse_docx
 from parsers.pdf_parser import parse_pdf
@@ -84,6 +112,9 @@ QUARANTINE_THRESHOLD = 3
 # can't spike memory) to keep the hot path write-free.
 INFLIGHT_DIR      = Path("/var/pkp/inflight")
 BREADCRUMB_MIN_MB = float(os.getenv("PKP_BREADCRUMB_MIN_MB", "1.0"))
+EMBED_BATCH          = int(os.getenv("PKP_EMBED_BATCH", "5000"))
+PKP_FILE_NO_PROGRESS = float(os.getenv("PKP_FILE_NO_PROGRESS", "900"))   # 15 min zero batch progress => hang
+WATCHDOG_TRIP_FILE   = INFLIGHT_DIR / "_watchdog_tripped.json"
 
 # Priority indexing: a user can designate one or more OneDrive folders to be
 # indexed FIRST, before the rest of the library. This lets them test searches
@@ -366,7 +397,7 @@ def _delete_item_chunks(client: QdrantClient, onedrive_item_id: str) -> None:
     )
 
 
-def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
+def _upsert_chunks(client: QdrantClient, chunks: list[Chunk], commit: bool = True) -> None:
     """
     Upsert all chunks for one file, then write a 'committed=True' marker on
     chunk 0 as the final step.
@@ -413,6 +444,15 @@ def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
             payload=payload,
         )
 
+    if not commit:
+        # Streaming batch: write every point as committed=False. Chunk 0 is
+        # flipped to committed=True by _mark_committed after the FINAL batch,
+        # so a crash mid-stream leaves the file detectably half-indexed.
+        all_pts = list(points_by_index.values())
+        for i in range(0, len(all_pts), 500):
+            client.upsert(collection_name=COLLECTION, points=all_pts[i:i + 500])
+        return
+
     # Write chunk 0 LAST with committed=True; write everything else first.
     chunk0 = points_by_index.pop(0, None)
     rest = list(points_by_index.values())
@@ -427,6 +467,17 @@ def _upsert_chunks(client: QdrantClient, chunks: list[Chunk]) -> None:
     if chunk0 is not None:
         chunk0.payload["committed"] = True
         client.upsert(collection_name=COLLECTION, points=[chunk0])
+
+
+def _mark_committed(client: QdrantClient, onedrive_item_id: str) -> None:
+    """Flip chunk 0's committed flag to True — the final step that marks a
+    streamed file fully indexed, so the dedup checks (_existing_hash /
+    _existing_mtime) skip it on the next run."""
+    client.set_payload(
+        collection_name=COLLECTION,
+        payload={"committed": True},
+        points=[_point_id(onedrive_item_id, 0)],
+    )
 
 # ── Bad-file quarantine ───────────────────────────────────────────────────────
 
@@ -568,6 +619,18 @@ def _breadcrumb_clear(tag: str) -> None:
         log.warning("breadcrumb clear failed: %s", e)
 
 
+def _breadcrumb_touch(tag: str) -> None:
+    """Refresh this worker's breadcrumb mtime to signal progress (called per
+    streamed batch). The no-progress watchdog keys on this mtime, so a
+    slow-but-progressing huge file is never mistaken for a hang."""
+    try:
+        p = INFLIGHT_DIR / (tag + ".json")
+        if p.exists():
+            os.utime(p, None)
+    except Exception:
+        pass
+
+
 def _recover_inflight() -> None:
     """Run once at startup. Any leftover breadcrumb names a file that was being
     processed when the previous run was killed (OOM / recycle) before it could
@@ -575,11 +638,41 @@ def _recover_inflight() -> None:
     process-killer reaches QUARANTINE_THRESHOLD and is skipped, then clear all
     breadcrumbs. Strikes on innocent in-flight files are harmless -- they reset
     via _clear_failure the next time the file processes cleanly."""
+    # Watchdog-attributed kill: the previous exit was a deliberate no-progress
+    # force-recycle that named the culprit. Quarantine exactly that file
+    # (immediate) and clear the other breadcrumbs WITHOUT striking them —
+    # they were innocent, killed by the hard os._exit.
+    if WATCHDOG_TRIP_FILE.exists():
+        try:
+            d = json.loads(WATCHDOG_TRIP_FILE.read_text())
+        except Exception:
+            d = {}
+        try:
+            WATCHDOG_TRIP_FILE.unlink()
+        except Exception:
+            pass
+        oid = d.get("onedrive_item_id")
+        if oid:
+            _record_failure(oid, d.get("file_name", "?"), d.get("content_hash"),
+                            "WATCHDOG: no progress for too long (likely a wedged network call)",
+                            immediate=True)
+            log.warning("CRASH-RECOVERY: watchdog-quarantined %s (no-progress hang)", d.get("file_name", "?"))
+        for p in INFLIGHT_DIR.glob("*.json"):
+            if p.name.startswith("_"):
+                continue
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        return
+
     recovered: list[str] = []
     try:
         if not INFLIGHT_DIR.exists():
             return
         for p in sorted(INFLIGHT_DIR.glob("*.json")):
+            if p.name.startswith("_"):
+                continue
             try:
                 data = json.loads(p.read_text())
             except Exception:
@@ -610,6 +703,50 @@ def _recover_inflight() -> None:
             "failure strike each (%d strikes => quarantined): %s",
             len(recovered), QUARANTINE_THRESHOLD, "; ".join(recovered[:10]),
         )
+
+
+def _start_file_watchdog(recycle_event, stop_event) -> None:
+    """Daemon thread. If a worker makes NO progress on a file for
+    PKP_FILE_NO_PROGRESS seconds (its breadcrumb mtime goes stale), the worker
+    is wedged (e.g. a network call with no timeout). Dump every thread's stack,
+    name the culprit in a sidecar so _recover_inflight quarantines exactly that
+    file, and os._exit(75) so systemd restarts. Streaming refreshes the
+    breadcrumb every batch, so a slow-but-progressing file is never killed."""
+    def _watch():
+        while not stop_event.wait(30):
+            if recycle_event.is_set():
+                continue  # a cooperative RSS recycle is already draining; don't hard-kill
+            try:
+                now = time.time()
+                for p in INFLIGHT_DIR.glob("*.json"):
+                    if p.name.startswith("_"):
+                        continue
+                    try:
+                        age = now - p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if age > PKP_FILE_NO_PROGRESS:
+                        try:
+                            payload = p.read_text()
+                        except Exception:
+                            payload = "{}"
+                        log.critical(
+                            "WATCHDOG: no progress for %.0fs (>%.0f) - dumping stacks "
+                            "and force-recycling (exit 75). breadcrumb=%s",
+                            age, PKP_FILE_NO_PROGRESS, payload[:200],
+                        )
+                        try:
+                            faulthandler.dump_traceback(all_threads=True)
+                        except Exception:
+                            pass
+                        try:
+                            WATCHDOG_TRIP_FILE.write_text(payload)
+                        except Exception:
+                            pass
+                        os._exit(75)
+            except Exception as e:
+                log.warning("watchdog scan error: %s", e)
+    _threading.Thread(target=_watch, name="file-watchdog", daemon=True).start()
 
 
 # ── Priority indexing ─────────────────────────────────────────────────────────
@@ -996,16 +1133,88 @@ def process_file(
     if _bc_tag:
         _breadcrumb_start(_bc_tag, onedrive_item_id, file_name, file_hash)
     try:
+        # Stream parse -> chunk -> embed -> upsert in bounded batches so a huge
+        # file (e.g. a 250MB CSV ~= 1.1M chunks) indexes FULLY without ever
+        # holding more than one batch in memory. Normal files (< one batch) run
+        # exactly one iteration and end identically to the old all-at-once path.
+        # Chunk 0 is committed only after the LAST batch, so a crash mid-stream
+        # leaves committed=False and the existing dedup reprocesses the file.
         try:
-            raw_chunks = _parse_file(local_path)
+            _stream = _batched(_parse_file(local_path), EMBED_BATCH)
         except Exception as e:
             n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}", immediate=True)
             log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
             return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
-        if not raw_chunks:
-            # Empty isn't a "bad file" — clear any stale failures (file may have
-            # been re-saved as legitimately empty).
+        deleted = False
+        total = 0
+        while True:
+            try:
+                raw_batch = next(_stream)
+            except StopIteration:
+                break
+            except Exception as e:
+                if deleted:
+                    try:
+                        _delete_item_chunks(client, onedrive_item_id)
+                    except Exception:
+                        pass
+                n = _record_failure(onedrive_item_id, file_name, file_hash, f"PARSE: {e}", immediate=True)
+                log.error("PARSE ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
+                return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
+
+            try:
+                chunked  = chunk_texts(raw_batch, start_index=total)
+                embedded = embed_chunks(chunked)
+            except Exception as e:
+                if deleted:
+                    try:
+                        _delete_item_chunks(client, onedrive_item_id)
+                    except Exception:
+                        pass
+                n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}", immediate=True)
+                log.error("CHUNK/EMBED ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
+                return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
+
+            batch: list[Chunk] = []
+            for ec in embedded:
+                batch.append(Chunk(
+                    text             = ec["text"],
+                    chunk_type       = ec.get("type", "text"),
+                    file_path        = file_path,
+                    file_name        = file_name,
+                    file_type        = file_type,
+                    onedrive_item_id = onedrive_item_id,
+                    modified_date    = modified_date,
+                    created_date     = created_date,
+                    content_hash     = file_hash,
+                    chunk_index      = ec["chunk_index"],
+                    author           = author,
+                    page_number      = ec.get("page_number") or ec.get("page"),
+                    slide_number     = ec.get("slide_number"),
+                    sheet_name       = ec.get("sheet_name"),
+                    vector           = ec["vector"],
+                ))
+
+            try:
+                if not deleted:
+                    # Delete old chunks once, right before the first write, so a
+                    # parse/embed failure on batch 1 leaves the old copy intact.
+                    _delete_item_chunks(client, onedrive_item_id)
+                    deleted = True
+                _upsert_chunks(client, batch, commit=False)
+            except Exception as e:
+                # Qdrant errors are typically transient — don't quarantine.
+                log.error("QDRANT ERROR  %s: %s", file_name, e)
+                return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
+
+            total += len(batch)
+            if _bc_tag:
+                _breadcrumb_touch(_bc_tag)
+
+        if total == 0:
+            # Parsed to nothing — not a bad file. Old chunks (if any) were never
+            # deleted (no batch ran), matching the previous "empty" behaviour.
             _clear_failure(onedrive_item_id)
             try:
                 _eb = Path(local_path).stat().st_size
@@ -1015,48 +1224,16 @@ def process_file(
             return {"file": file_name, "status": "empty", "chunks": 0, "error": None}
 
         try:
-            chunked  = chunk_texts(raw_chunks)
-            embedded = embed_chunks(chunked)
+            _mark_committed(client, onedrive_item_id)
         except Exception as e:
-            n = _record_failure(onedrive_item_id, file_name, file_hash, f"CHUNK/EMBED: {e}", immediate=True)
-            log.error("CHUNK/EMBED ERROR  %s (failure %d/%d): %s", file_name, n, QUARANTINE_THRESHOLD, e)
+            # Commit-marker write failed (transient Qdrant) — don't quarantine;
+            # chunk 0 stays committed=False so the file reprocesses next run.
+            log.error("COMMIT ERROR  %s: %s", file_name, e)
             return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
 
-        chunks: list[Chunk] = []
-        for ec in embedded:
-            chunks.append(Chunk(
-                text             = ec["text"],
-                chunk_type       = ec.get("type", "text"),
-                file_path        = file_path,
-                file_name        = file_name,
-                file_type        = file_type,
-                onedrive_item_id = onedrive_item_id,
-                modified_date    = modified_date,
-                created_date     = created_date,
-                content_hash     = file_hash,
-                chunk_index      = ec["chunk_index"],
-                author           = author,
-                page_number      = ec.get("page_number") or ec.get("page"),
-                slide_number     = ec.get("slide_number"),
-                sheet_name       = ec.get("sheet_name"),
-                vector           = ec["vector"],
-            ))
-
-        try:
-            # Delete old chunks first so stale points don't accumulate
-            _delete_item_chunks(client, onedrive_item_id)
-            _upsert_chunks(client, chunks)
-        except Exception as e:
-            # Qdrant errors are typically transient (network, server restart) —
-            # don't count them toward quarantine. The next run will retry.
-            log.error("QDRANT ERROR  %s: %s", file_name, e)
-            return {"file": file_name, "status": "error", "chunks": 0, "error": str(e)}
-
-        # Successful end-to-end — clear any prior quarantine state for this file.
         _clear_failure(onedrive_item_id)
-
-        log.info("OK    %s → %d chunks", file_name, len(chunks))
-        return {"file": file_name, "status": "ok", "chunks": len(chunks), "error": None}
+        log.info("OK    %s → %d chunks", file_name, total)
+        return {"file": file_name, "status": "ok", "chunks": total, "error": None}
     finally:
         if _bc_tag:
             _breadcrumb_clear(_bc_tag)
@@ -1144,6 +1321,14 @@ def run_full(force: bool = False) -> None:
     # run was killed (OOM / recycle) before it could be caught + quarantined.
     _recover_inflight()
 
+    # Load the embedding model ONCE here (main thread, bounded by a timeout) so
+    # no worker can wedge on a lazy HuggingFace network load (the 45-min hang).
+    try:
+        _embedder_warmup()
+    except Exception as e:
+        log.critical("Model warmup failed (%s) - exiting so systemd retries", e)
+        sys.exit(1)
+
     # Clean up any leftover temp files from a previous crashed run.
     for f in WORK_DIR.glob("*"):
         try:
@@ -1215,6 +1400,10 @@ def run_full(force: bool = False) -> None:
                     stop_event.set()
                     return
     threading.Thread(target=_rss_monitor, name="rss-monitor", daemon=True).start()
+
+    # Per-file no-progress watchdog: force-recycle if a worker makes zero
+    # progress on a file for PKP_FILE_NO_PROGRESS seconds (a true hang).
+    _start_file_watchdog(recycle_event, stop_event)
 
     def _process_item(item: dict, *, track_progress: bool) -> dict:
         """
@@ -1569,6 +1758,12 @@ def run_delta() -> None:
 
     # Crash-recovery: see run_full -- strike any file mid-process at last kill.
     _recover_inflight()
+
+    try:
+        _embedder_warmup()
+    except Exception as e:
+        log.critical("Model warmup failed (%s) - exiting so systemd retries", e)
+        sys.exit(1)
 
     tm    = TokenManager()
     GRAPH = "https://graph.microsoft.com/v1.0"

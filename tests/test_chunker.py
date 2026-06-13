@@ -107,3 +107,8 @@ def test_extra_metadata_preserved_across_table_split():
 
 def test_empty_input():
     assert chunk_texts([]) == []
+
+
+def test_start_index_offsets_chunk_index():
+    out = chunk_texts([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], start_index=10)
+    assert [x["chunk_index"] for x in out] == [10, 11]
