@@ -96,6 +96,7 @@ SUPPORTED_EXTS   = {".docx", ".pdf", ".xlsx", ".pptx", ".txt", ".md", ".csv"}
 WORK_DIR         = Path("/var/pkp/work")
 DELTA_TOKEN_FILE = Path("/var/pkp/delta_token.json")
 FULL_CURSOR_FILE = Path("/var/pkp/full_cursor.json")
+FULL_INDEX_COMPLETE_FILE = Path("/var/pkp/full_index_complete.json")
 PRIORITY_CURSOR_FILE = Path("/var/pkp/priority_cursor.json")
 EXCLUSIONS_FILE  = REPO_ROOT / "config" / "exclusions.txt"
 
@@ -269,10 +270,67 @@ def _parse_file(file_path: str) -> list[dict]:
 
 # ── Qdrant helpers ────────────────────────────────────────────────────────────
 
+_QDRANT_CONN_MARKERS = (
+    "disconnect", "connection", "closed", "reset", "timed out", "timeout",
+    "cannot send a request", "remoteprotocol", "connecterror", "broken pipe",
+    "server disconnected",
+)
+
+
+def _is_qdrant_conn_error(exc) -> bool:
+    s = (str(exc) + " " + type(exc).__name__).lower()
+    return any(m in s for m in _QDRANT_CONN_MARKERS)
+
+
+class _ResilientQdrant:
+    """Thin proxy around QdrantClient that rides out transient connection drops
+    (e.g. a Qdrant OOM-restart). On a connection error it recreates the
+    underlying client, backs off, and retries; non-connection errors pass
+    straight through. This stops a brief Qdrant blip from aborting the whole
+    run (which previously exited cleanly and left the service silently dead)."""
+
+    _RETRY = {"retrieve", "upsert", "delete", "set_payload", "get_collection",
+              "create_payload_index", "scroll", "count", "search", "query_points"}
+
+    def __init__(self, factory, attempts: int = 5, base_delay: float = 3.0):
+        self._factory = factory
+        self._attempts = attempts
+        self._base_delay = base_delay
+        self._client = factory()
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        attr = getattr(self._client, name)
+        if name not in self._RETRY or not callable(attr):
+            return attr
+
+        def _wrapped(*args, **kwargs):
+            last = None
+            for i in range(self._attempts):
+                try:
+                    return getattr(self._client, name)(*args, **kwargs)
+                except Exception as e:
+                    last = e
+                    if not _is_qdrant_conn_error(e) or i == self._attempts - 1:
+                        raise
+                    delay = self._base_delay * (i + 1)
+                    log.warning("Qdrant %s failed (attempt %d/%d): %s -- reconnecting in %.0fs",
+                                name, i + 1, self._attempts, e, delay)
+                    time.sleep(delay)
+                    try:
+                        self._client = self._factory()
+                    except Exception as re:
+                        log.warning("Qdrant reconnect failed: %s", re)
+            raise last
+
+        return _wrapped
+
+
 def _get_qdrant() -> QdrantClient:
     host = os.getenv("QDRANT_HOST", "localhost")
     port = int(os.getenv("QDRANT_PORT", 6333))
-    return QdrantClient(host=host, port=port)
+    return _ResilientQdrant(lambda: QdrantClient(host=host, port=port))
 
 
 def _ensure_collection(client: QdrantClient) -> None:
@@ -1301,6 +1359,41 @@ def run_local(folder: str, force: bool = False) -> None:
 
 # ── OneDrive full mode ────────────────────────────────────────────────────────
 
+def _write_completion_marker() -> None:
+    """Record that the full library has been completely indexed."""
+    try:
+        FULL_INDEX_COMPLETE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        FULL_INDEX_COMPLETE_FILE.write_text(json.dumps(
+            {"completed_at": datetime.now(tz=timezone.utc).isoformat()}, indent=2))
+    except Exception as e:
+        log.warning("could not write completion marker: %s", e)
+
+
+def _finalize_run(recycle_event, stop_event, completed: bool) -> None:
+    """Decide the process exit by HOW the run ended. Invariant: exit 0 ONLY on a
+    genuine completion or a deliberate stop; non-zero on anything else so systemd
+    (Restart=on-failure) restarts and resumes from the cursor. A transient
+    Qdrant/DB blip therefore can never leave the service silently dead, and a real
+    completion stops cleanly instead of looping forever."""
+    if completed:
+        _write_completion_marker()
+        log.info("FULL INDEX COMPLETE -- the library is fully indexed. Exiting 0; the "
+                 "service stops. Run --delta to pick up later changes, or delete %s to "
+                 "force a full re-walk.", FULL_INDEX_COMPLETE_FILE)
+        return
+    if recycle_event.is_set():
+        log.warning("Memory-ceiling recycle: exiting (code 75) so systemd restarts a fresh "
+                    "process. Already-indexed files skip instantly on resume.")
+        sys.exit(75)
+    if stop_event.is_set():
+        log.info("Graceful shutdown (SIGINT/SIGTERM) -- will resume from the cursor on next start.")
+        return
+    log.error("Indexing run ended WITHOUT completing and WITHOUT a recycle or deliberate "
+              "stop -- most likely a Qdrant/DB disconnect or an error. Exiting 1 so systemd "
+              "restarts and resumes from the cursor (NOT a clean finish).")
+    sys.exit(1)
+
+
 def run_full(force: bool = False) -> None:
     """
     Streaming full-index run.
@@ -1333,6 +1426,12 @@ def run_full(force: bool = False) -> None:
     import signal
     import threading
     from onedrive import TokenManager
+
+    if FULL_INDEX_COMPLETE_FILE.exists() and not force:
+        log.info("Full index already complete (%s present) -- nothing to do; exiting 0 so "
+                 "the service stays stopped. Run --delta for changes, or delete the marker "
+                 "to force a full re-walk.", FULL_INDEX_COMPLETE_FILE)
+        return
 
     exclusions = _load_exclusions()
     client = _get_qdrant()
@@ -1701,6 +1800,7 @@ def run_full(force: bool = False) -> None:
 
     all_results: list[dict] = []
     total_submitted = 0
+    p2_completed = False
 
     try:
         # ── Phase 1: priority folders first (resumable, filtered walk) ────
@@ -1740,7 +1840,7 @@ def run_full(force: bool = False) -> None:
         # ── Phase 2: rest of the library (resumable, priority excluded) ───
         if not stop_event.is_set():
             phase2_exclude = priority_folders if priority_folders else None
-            p2_results, p2_submitted, _ = _run_resumable_full(
+            p2_results, p2_submitted, p2_completed = _run_resumable_full(
                 exclude_path_prefixes=phase2_exclude,
                 cursor_file=FULL_CURSOR_FILE,
                 save_delta_token=True,
@@ -1755,12 +1855,7 @@ def run_full(force: bool = False) -> None:
 
     _print_summary(all_results, total_files=total_submitted)
 
-    if recycle_event.is_set():
-        log.warning(
-            "Memory-ceiling recycle: exiting (code 75) so systemd restarts a fresh "
-            "process. Already-indexed files skip instantly on resume."
-        )
-        sys.exit(75)
+    _finalize_run(recycle_event, stop_event, p2_completed)
 
 # ── OneDrive delta mode ───────────────────────────────────────────────────────
 
@@ -2355,4 +2450,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        log.critical("Unhandled exception in main -- exiting 1 so systemd restarts.", exc_info=True)
+        sys.exit(1)
