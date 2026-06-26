@@ -343,8 +343,12 @@ def _ensure_collection(client: QdrantClient) -> None:
                 binary=BinaryQuantizationConfig(always_ram=True)
             ),
             # m=16 is fine; ef_construct=256 gives much better recall at 1TB scale.
-            # Only takes effect on new collections — rebuild required to upgrade existing.
-            hnsw_config=HnswConfigDiff(m=16, ef_construct=256),
+            # on_disk=True keeps the HNSW graph memory-mapped instead of in RAM, so the
+            # index scales past host RAM at 1TB+. Fresh collections get it here; an
+            # EXISTING collection is migrated in place with
+            # update_collection(hnsw_config=HnswConfigDiff(on_disk=True)) (the optimizer
+            # rebuilds its segments onto disk).
+            hnsw_config=HnswConfigDiff(m=16, ef_construct=256, on_disk=True),
         )
         log.info("Created Qdrant collection '%s'", COLLECTION)
 
